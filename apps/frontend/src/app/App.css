@@ -241,6 +241,14 @@ body {
   gap: 16px;
 }
 
+/* When context-tags immediately follow panel-header, merge them visually */
+.panel-header + .context-tags {
+  background: var(--panel-muted);
+  border-bottom: 1px solid var(--border);
+  margin-top: -1px;
+  padding: 6px 14px 8px;
+}
+
 .header-controls {
   display: flex;
   gap: 8px;
@@ -653,11 +661,15 @@ body {
 .side-panel .chat-messages {
   flex: 1;
   padding: 12px;
+  padding-bottom: 18px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
   gap: 10px;
   min-height: 0;
+  position: relative;
+  mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
 }
 
 .chat-msg {
@@ -682,12 +694,14 @@ body {
 
 .chat-controls {
   padding: 10px 12px 12px;
-  border-top: 1px solid var(--border);
+  border-top: none;
+  box-shadow: 0 -6px 12px -4px rgba(120, 98, 83, 0.06);
   display: flex;
   flex-direction: column;
   gap: 8px;
   position: relative;
   overflow: visible;
+  background: linear-gradient(to bottom, rgba(255, 253, 249, 0.6), rgba(255, 253, 249, 1) 8px);
 }
 
 .chat-control-row {
