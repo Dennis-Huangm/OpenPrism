@@ -1234,6 +1234,9 @@ export default function EditorPage() {
   const [task, setTask] = useState(DEFAULT_TASKS(t)[0].value);
   const [mode, setMode] = useState<'direct' | 'tools'>('direct');
   const [translateScope, setTranslateScope] = useState<'selection' | 'file' | 'project'>('selection');
+  const [includeCurrentFile, setIncludeCurrentFile] = useState(true);
+  const [includeCompileLog, setIncludeCompileLog] = useState(true);
+  const [includeSelection, setIncludeSelection] = useState(true);
   const [translateTarget, setTranslateTarget] = useState('English');
   const [taskDropdownOpen, setTaskDropdownOpen] = useState(false);
   const [modeDropdownOpen, setModeDropdownOpen] = useState(false);
@@ -3448,8 +3451,15 @@ export default function EditorPage() {
       let effectivePrompt = prompt;
       let effectiveSelection = selectionText;
       let effectiveContent = editorValue;
+      let effectiveCompileLog = compileLog;
       let effectiveMode = mode;
       let effectiveTask = task;
+
+      if (isChat) {
+        if (!includeCurrentFile) effectiveContent = '';
+        if (!includeSelection) effectiveSelection = '';
+        if (!includeCompileLog) effectiveCompileLog = '';
+      }
 
       if (!isChat && task === 'translate') {
         const note = prompt ? `\n${t('User note')}: ${prompt}` : '';
@@ -3493,7 +3503,7 @@ export default function EditorPage() {
         mode: isChat ? 'direct' : effectiveMode,
         projectId,
         activePath,
-        compileLog,
+        compileLog: effectiveCompileLog,
         llmConfig: effectiveLlmConfig,
         interaction: isChat ? 'chat' : 'agent',
         history: nextHistory.slice(-8)
@@ -4031,9 +4041,22 @@ export default function EditorPage() {
                 </div>
                 {assistantMode === 'chat' && (
                   <div className="context-tags">
-                    <span className="context-tag">{t('只读当前文件')}</span>
-                    {selectionText && <span className="context-tag">{t('只读选区')}</span>}
-                    {compileLog && <span className="context-tag">{t('只读编译日志')}</span>}
+                    <span
+                      className={`context-tag ${includeCurrentFile ? 'active' : ''}`}
+                      onClick={() => setIncludeCurrentFile(!includeCurrentFile)}
+                    >{t('读取当前文件')}</span>
+                    {selectionText && (
+                      <span
+                        className={`context-tag ${includeSelection ? 'active' : ''}`}
+                        onClick={() => setIncludeSelection(!includeSelection)}
+                      >{t('读取选区')}</span>
+                    )}
+                    {compileLog && (
+                      <span
+                        className={`context-tag ${includeCompileLog ? 'active' : ''}`}
+                        onClick={() => setIncludeCompileLog(!includeCompileLog)}
+                      >{t('读取编译日志')}</span>
+                    )}
                   </div>
                 )}
                 <div className="chat-messages">

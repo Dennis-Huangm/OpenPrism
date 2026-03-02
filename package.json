@@ -9,6 +9,7 @@
     "dev": "concurrently \"npm --workspace apps/backend run dev\" \"npm --workspace apps/frontend run dev\"",
     "dev:backend": "npm --workspace apps/backend run dev",
     "dev:frontend": "npm --workspace apps/frontend run dev",
+    "start": "node apps/backend/src/index.js",
     "build": "npm --workspace apps/frontend run build",
     "preview": "npm --workspace apps/frontend run preview",
     "tunnel": "npm run build && cross-env OPENPRISM_TUNNEL=localtunnel node apps/backend/src/index.js",
