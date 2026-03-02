@@ -249,8 +249,22 @@ body {
 
 .panel-header + .context-tags {
   background: var(--panel-muted);
-  border-bottom: 2px solid var(--border);
-  padding: 3px 14px 8px;
+  border-bottom: none;
+  padding: 2px 14px 10px;
+  position: relative;
+  z-index: 1;
+}
+
+.panel-header + .context-tags::after {
+  content: '';
+  position: absolute;
+  bottom: -20px;
+  left: 0;
+  right: 0;
+  height: 20px;
+  background: linear-gradient(to bottom, rgba(120, 98, 83, 0.01), transparent);
+  pointer-events: none;
+  z-index: 1;
 }
 
 .header-controls {
@@ -672,8 +686,8 @@ body {
   gap: 10px;
   min-height: 0;
   position: relative;
-  mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
-  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 24px), transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0%, black 24px, black calc(100% - 24px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 24px, black calc(100% - 24px), transparent 100%);
 }
 
 .chat-msg {
