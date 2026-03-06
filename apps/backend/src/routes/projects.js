@@ -262,7 +262,12 @@ export function registerProjectRoutes(fastify) {
     let fileOrder = {};
     try {
       const meta = await readJson(path.join(projectRoot, 'project.json'));
-      fileOrder = meta?.fileOrder || {};
+      const rawOrder = meta?.fileOrder || {};
+      fileOrder = {};
+      for (const key in rawOrder) {
+        const normalizedKey = key.replace(/\\/g, '/');
+        fileOrder[normalizedKey] = rawOrder[key].map(p => p.replace(/\\/g, '/'));
+      }
     } catch {
       fileOrder = {};
     }

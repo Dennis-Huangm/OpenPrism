@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, Dispatch, MouseEvent, SetStateAction, RefObject, DragEvent } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties, Dispatch, MouseEvent, SetStateAction, RefObject, DragEvent, MutableRefObject } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import ReactMarkdown from 'react-markdown';
@@ -75,6 +75,15 @@ type InlineEdit =
   | { kind: 'rename'; path: string; value: string };
 
 type CompileEngine = 'pdflatex' | 'xelatex' | 'lualatex' | 'latexmk' | 'tectonic';
+
+type PdfZoomAnchor = {
+  mouseX: number;
+  mouseY: number;
+  contentX: number;
+  contentY: number;
+  oldScale: number;
+  newScale: number;
+};
 
 type AppSettings = {
   llmEndpoint: string;
@@ -481,7 +490,8 @@ function buildTree(items: { path: string; type: string }[], orderMap: Record<str
   const sorted = [...items].sort((a, b) => a.path.localeCompare(b.path));
 
   sorted.forEach((item) => {
-    const parts = item.path.split('/').filter(Boolean);
+    const normalizedPath = item.path.replace(/\\/g, '/');
+    const parts = normalizedPath.split('/').filter(Boolean);
     let currentPath = '';
     parts.forEach((part, index) => {
       const nextPath = currentPath ? `${currentPath}/${part}` : part;
@@ -1070,7 +1080,9 @@ function PdfPreview({
   annotations,
   annotateMode,
   onAddAnnotation,
-  containerRef: externalRef
+  containerRef: externalRef,
+  zoomAnchorRef,
+  clarityMode
 }: {
   pdfUrl: string;
   scale: number;
@@ -1083,27 +1095,140 @@ function PdfPreview({
   annotateMode: boolean;
   onAddAnnotation?: (page: number, x: number, y: number) => void;
   containerRef?: RefObject<HTMLDivElement>;
+  zoomAnchorRef?: MutableRefObject<PdfZoomAnchor | null>;
+  clarityMode: 'smooth' | 'sharp';
 }) {
   const { t } = useTranslation();
   const localRef = useRef<HTMLDivElement | null>(null);
   const containerRef = externalRef || localRef;
+  const sizerRef = useRef<HTMLDivElement | null>(null);
+  const contentWrapperRef = useRef<HTMLDivElement | null>(null);
+  const renderedScaleRef = useRef<number>(0);
+  const nativeDimsRef = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
+  const scaleRef = useRef(scale);
+  scaleRef.current = scale;
+  const renderTimerRef = useRef<number | null>(null);
+  const [renderEpoch, setRenderEpoch] = useState(0);
 
+  // Debounced high-quality rerender after manual zoom settles.
+  // Larger zoom gaps use shorter delay so text sharpens faster.
+  useEffect(() => {
+    const hadPendingTimer = renderTimerRef.current != null;
+    if (renderTimerRef.current) {
+      clearTimeout(renderTimerRef.current);
+      renderTimerRef.current = null;
+    }
+
+    if (!pdfUrl || fitWidth) return;
+    const renderedScale = renderedScaleRef.current;
+    if (renderedScale <= 0) return;
+
+    const relativeGap = Math.abs(scale / renderedScale - 1);
+    if (relativeGap < 0.03 && !hadPendingTimer) return;
+
+    const delay = clarityMode === 'sharp'
+      ? relativeGap >= 0.45 ? 80 : relativeGap >= 0.25 ? 100 : relativeGap >= 0.12 ? 120 : 150
+      : relativeGap >= 0.45 ? 120 : relativeGap >= 0.25 ? 150 : relativeGap >= 0.12 ? 180 : 220;
+
+    renderTimerRef.current = window.setTimeout(() => {
+      renderTimerRef.current = null;
+      setRenderEpoch((v) => v + 1);
+    }, delay);
+
+    return () => {
+      if (renderTimerRef.current) {
+        clearTimeout(renderTimerRef.current);
+        renderTimerRef.current = null;
+      }
+    };
+  }, [clarityMode, fitWidth, pdfUrl, scale]);
+
+  // Instant visual zoom via CSS transform (no canvas re-render)
+  useLayoutEffect(() => {
+    const container = containerRef.current;
+    const wrapper = contentWrapperRef.current;
+    const sizer = sizerRef.current;
+    const base = renderedScaleRef.current;
+    if (!container || !wrapper || !sizer || base <= 0) return;
+    const ratio = scale / base;
+    const pendingAnchor = zoomAnchorRef?.current;
+
+    const dataNativeW = parseFloat(wrapper.dataset.nativeW || '0');
+    const dataNativeH = parseFloat(wrapper.dataset.nativeH || '0');
+    let nativeW = nativeDimsRef.current.width > 0 ? nativeDimsRef.current.width : dataNativeW;
+    let nativeH = nativeDimsRef.current.height > 0 ? nativeDimsRef.current.height : dataNativeH;
+
+    if (nativeW <= 0 || nativeH <= 0) {
+      const measureScale = pendingAnchor?.oldScale ?? scale;
+      const measureRatio = measureScale > 0 ? measureScale / base : 0;
+      if (measureRatio > 0) {
+        const rect = wrapper.getBoundingClientRect();
+        nativeW = rect.width / measureRatio;
+        nativeH = rect.height / measureRatio;
+      }
+    }
+
+    // Publish rendered scale and native dims as data attributes so the parent
+    // (applyPdfScaleWithAnchor) can read them for immediate anchor computation.
+    wrapper.dataset.renderedScale = String(base);
+    if (nativeW > 0) {
+      nativeDimsRef.current = { width: nativeW, height: nativeH };
+      wrapper.dataset.nativeW = String(nativeW);
+      wrapper.dataset.nativeH = String(nativeH);
+    }
+
+    // Apply transform + scroll anchoring in one layout pass to avoid
+    // visible "first scale from top-left, then pan" jumps.
+    wrapper.style.transform = `scale(${ratio})`;
+
+    if (nativeW > 0) {
+      let targetW = nativeW * ratio;
+      let targetH = nativeH * ratio;
+
+      if (pendingAnchor && Math.abs(pendingAnchor.newScale - scale) < 1e-3 && pendingAnchor.oldScale > 0) {
+        const anchorRatio = scale / pendingAnchor.oldScale;
+        const sizerOffsetLeft = sizer.offsetLeft;
+        const desiredScrollLeft = Math.max(0, pendingAnchor.contentX * anchorRatio + sizerOffsetLeft - pendingAnchor.mouseX);
+        const desiredScrollTop = Math.max(0, pendingAnchor.contentY * anchorRatio - pendingAnchor.mouseY);
+        targetW = Math.max(targetW, desiredScrollLeft + container.clientWidth + 1);
+        targetH = Math.max(targetH, desiredScrollTop + container.clientHeight + 1);
+      }
+
+      sizer.style.width = `${targetW}px`;
+      sizer.style.height = `${targetH}px`;
+    }
+
+    if (pendingAnchor && Math.abs(pendingAnchor.newScale - scale) < 1e-3 && pendingAnchor.oldScale > 0) {
+      const anchorRatio = scale / pendingAnchor.oldScale;
+      const sizerOffsetLeft = sizer.offsetLeft;
+      const desiredScrollLeft = Math.max(0, pendingAnchor.contentX * anchorRatio + sizerOffsetLeft - pendingAnchor.mouseX);
+      const desiredScrollTop = Math.max(0, pendingAnchor.contentY * anchorRatio - pendingAnchor.mouseY);
+      const maxScrollLeft = Math.max(0, container.scrollWidth - container.clientWidth);
+      const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+      container.scrollLeft = Math.min(maxScrollLeft, desiredScrollLeft);
+      container.scrollTop = Math.min(maxScrollTop, desiredScrollTop);
+      zoomAnchorRef.current = null;
+    } else if (pendingAnchor && Math.abs(pendingAnchor.newScale - scale) >= 1e-3) {
+      zoomAnchorRef.current = null;
+    }
+  }, [scale]);
+
+  // Main canvas render (on pdfUrl/fitWidth/spread changes, plus debounced manual-zoom rerender)
   useEffect(() => {
     const container = containerRef.current;
     if (!container || !pdfUrl) return;
     let cancelled = false;
-    container.innerHTML = '';
 
     const render = async () => {
       try {
         const loadingTask = getDocument(pdfUrl);
         const pdf = await loadingTask.promise;
 
-        // 获取容器宽度用于计算缩放比例
-        const containerWidth = container.clientWidth - 24; // 减去 padding
+        const containerWidth = container.clientWidth - 24;
         const pageTargetWidth = spread ? Math.max(200, (containerWidth - 16) / 2) : containerWidth;
 
-        let baseScale = scale;
+        const requestedScaleAtStart = scaleRef.current;
+        let baseScale = requestedScaleAtStart;
         let firstPage: Awaited<ReturnType<typeof pdf.getPage>> | null = null;
         if (fitWidth && containerWidth > 0) {
           firstPage = await pdf.getPage(1);
@@ -1117,7 +1242,6 @@ function PdfPreview({
         }
 
         const renderPage = async (page: Awaited<ReturnType<typeof pdf.getPage>>) => {
-          // 先获取原始尺寸
           const cssViewport = page.getViewport({ scale: baseScale });
           const qualityBoost = Math.min(2.4, (window.devicePixelRatio || 1) * 1.25);
           const renderViewport = page.getViewport({ scale: baseScale * qualityBoost });
@@ -1157,31 +1281,102 @@ function PdfPreview({
         const wrappers: HTMLElement[] = [];
         if (firstPage) {
           if (cancelled) return;
-          const firstWrapper = await renderPage(firstPage);
-          wrappers.push(firstWrapper);
+          wrappers.push(await renderPage(firstPage));
         }
-
         for (let pageNum = firstPage ? 2 : 1; pageNum <= pdf.numPages; pageNum += 1) {
           if (cancelled) return;
           const page = await pdf.getPage(pageNum);
-          const wrapper = await renderPage(page);
-          wrappers.push(wrapper);
+          wrappers.push(await renderPage(page));
         }
+
+        if (cancelled) return;
+
+        // Build new DOM off-screen for atomic swap
+        const newSizer = document.createElement('div');
+        newSizer.className = 'pdf-sizer';
+        const newWrapper = document.createElement('div');
+        newWrapper.className = 'pdf-content-wrapper';
+        // Expose base render scale immediately so zoom handlers can do
+        // same-frame DOM transforms before any React effect runs.
+        newWrapper.dataset.renderedScale = String(baseScale);
 
         if (spread) {
           for (let idx = 0; idx < wrappers.length; idx += 2) {
             const row = document.createElement('div');
             row.className = 'pdf-spread';
             row.appendChild(wrappers[idx]);
-            if (wrappers[idx + 1]) {
-              row.appendChild(wrappers[idx + 1]);
-            }
-            container.appendChild(row);
+            if (wrappers[idx + 1]) row.appendChild(wrappers[idx + 1]);
+            newWrapper.appendChild(row);
           }
         } else {
-          wrappers.forEach((wrapper) => container.appendChild(wrapper));
+          wrappers.forEach((w) => newWrapper.appendChild(w));
         }
 
+        newSizer.appendChild(newWrapper);
+
+        const prevScrollLeft = container.scrollLeft;
+        const prevScrollTop = container.scrollTop;
+        const prevScrollableX = Math.max(0, container.scrollWidth - container.clientWidth);
+        const prevScrollableY = Math.max(0, container.scrollHeight - container.clientHeight);
+        const scrollRatioX = prevScrollableX > 0 ? container.scrollLeft / prevScrollableX : 0;
+        const scrollRatioY = prevScrollableY > 0 ? container.scrollTop / prevScrollableY : 0;
+
+        // Atomic swap — no blank flash
+        container.innerHTML = '';
+        container.appendChild(newSizer);
+        sizerRef.current = newSizer;
+        contentWrapperRef.current = newWrapper;
+        renderedScaleRef.current = baseScale;
+
+        // Measure native content dimensions at baseScale
+        const wrapperRect = newWrapper.getBoundingClientRect();
+        nativeDimsRef.current = {
+          width: wrapperRect.width,
+          height: wrapperRect.height
+        };
+        // Publish native dims immediately so same-frame zoom handler can use them
+        // before the next useLayoutEffect runs.
+        newWrapper.dataset.nativeW = String(nativeDimsRef.current.width);
+        newWrapper.dataset.nativeH = String(nativeDimsRef.current.height);
+
+        // Publish data attributes for parent's immediate DOM updates
+        newWrapper.dataset.renderedScale = String(baseScale);
+        newWrapper.dataset.nativeW = String(nativeDimsRef.current.width);
+        newWrapper.dataset.nativeH = String(nativeDimsRef.current.height);
+
+        // Apply current visual scale ratio
+        const currentScale = scaleRef.current;
+        const ratio = currentScale / baseScale;
+        newWrapper.style.transform = `scale(${ratio})`;
+        newSizer.style.width = `${nativeDimsRef.current.width * ratio}px`;
+        newSizer.style.height = `${nativeDimsRef.current.height * ratio}px`;
+
+        // Restore scroll position
+        // Only restore when scale hasn't changed during async render.
+        // If user zoomed while rendering, preserving old ratio causes a visible second jump.
+        const scaleChangedDuringRender = Math.abs(scaleRef.current - requestedScaleAtStart) > 1e-3;
+        if (!scaleChangedDuringRender) {
+          const nextScrollableX = Math.max(0, container.scrollWidth - container.clientWidth);
+          const nextScrollableY = Math.max(0, container.scrollHeight - container.clientHeight);
+
+          // During manual zoom (non-fit mode), keep exact pixel scroll to avoid
+          // a secondary reposition after async canvas re-render.
+          const keepExactScroll = !fitWidth && Math.abs(baseScale - requestedScaleAtStart) < 1e-3;
+          if (keepExactScroll || Math.abs(ratio - 1) < 1e-3) {
+            container.scrollLeft = Math.min(nextScrollableX, prevScrollLeft);
+            container.scrollTop = Math.min(nextScrollableY, prevScrollTop);
+          } else {
+            container.scrollLeft = nextScrollableX * scrollRatioX;
+            container.scrollTop = nextScrollableY * scrollRatioY;
+          }
+        }
+
+        // If scale changed while rendering, old pending anchor is stale for this frame.
+        if (zoomAnchorRef?.current && Math.abs(zoomAnchorRef.current.newScale - scaleRef.current) > 1e-3) {
+          zoomAnchorRef.current = null;
+        }
+
+        // Parse outline
         if (onOutline) {
           try {
             const outline = await pdf.getOutline();
@@ -1223,10 +1418,10 @@ function PdfPreview({
 
     return () => {
       cancelled = true;
-      container.innerHTML = '';
     };
-  }, [pdfUrl, fitWidth, onFitScale, scale, spread, onOutline, t]);
+  }, [pdfUrl, fitWidth, onFitScale, renderEpoch, spread, onOutline, t]);
 
+  // Annotations
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
@@ -1242,7 +1437,7 @@ function PdfPreview({
       marker.dataset.annotationId = note.id;
       pageEl.appendChild(marker);
     });
-  }, [annotations, pdfUrl, spread]);
+  }, [annotations, pdfUrl, renderEpoch, spread]);
 
   return (
     <div
@@ -1324,6 +1519,7 @@ export default function EditorPage() {
   const [pdfScale, setPdfScale] = useState(1);
   const [pdfFitWidth, setPdfFitWidth] = useState(true);
   const [pdfFitScale, setPdfFitScale] = useState<number | null>(null);
+  const [pdfClarityMode, setPdfClarityMode] = useState<'smooth' | 'sharp'>('sharp');
   const [pdfSpread, setPdfSpread] = useState(false);
   const [pdfOutline, setPdfOutline] = useState<{ title: string; page?: number; level: number }[]>([]);
   const [pdfAnnotations, setPdfAnnotations] = useState<{ id: string; page: number; x: number; y: number; text: string }[]>([]);
@@ -1428,6 +1624,13 @@ export default function EditorPage() {
   const gridRef = useRef<HTMLDivElement | null>(null);
   const editorSplitRef = useRef<HTMLDivElement | null>(null);
   const pdfContainerRef = useRef<HTMLDivElement | null>(null);
+  const pdfZoomAnchorRef = useRef<PdfZoomAnchor | null>(null);
+  const pdfScaleRef = useRef(pdfScale);
+  pdfScaleRef.current = pdfScale;
+  const pdfFitScaleRef = useRef(pdfFitScale);
+  pdfFitScaleRef.current = pdfFitScale;
+  const pdfFitWidthRef = useRef(pdfFitWidth);
+  pdfFitWidthRef.current = pdfFitWidth;
   const fileTreeRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
@@ -3597,6 +3800,11 @@ export default function EditorPage() {
     setPdfOutline([]);
   }, [pdfUrl]);
 
+  const effectivePdfScale = useMemo(
+    () => (pdfFitWidth ? (pdfFitScale ?? pdfScale) : pdfScale),
+    [pdfFitScale, pdfFitWidth, pdfScale]
+  );
+
   const pdfScaleLabel = useMemo(() => {
     if (pdfFitWidth) {
       const fitValue = pdfFitScale ?? pdfScale;
@@ -3609,14 +3817,86 @@ export default function EditorPage() {
 
   const clampPdfScale = useCallback((value: number) => Math.min(2.5, Math.max(0.6, value)), []);
 
+  const applyPdfScaleWithAnchor = useCallback(
+    (newScale: number, anchor?: { mouseX: number; mouseY: number }) => {
+      const oldScale = pdfFitWidthRef.current && pdfFitScaleRef.current != null
+        ? pdfFitScaleRef.current
+        : pdfScaleRef.current;
+      if (newScale === oldScale) return;
+
+      // Sync refs immediately to avoid one-frame stale state during rapid clicks/wheel.
+      pdfFitWidthRef.current = false;
+      pdfFitScaleRef.current = null;
+      pdfScaleRef.current = newScale;
+
+      const el = pdfContainerRef.current;
+      if (el) {
+        const mouseX = anchor?.mouseX ?? el.clientWidth / 2;
+        const mouseY = anchor?.mouseY ?? el.clientHeight / 2;
+
+        const sizer = el.querySelector('.pdf-sizer') as HTMLElement | null;
+        const sizerOffsetLeft = sizer ? sizer.offsetLeft : 0;
+
+        let scrollLeft = el.scrollLeft;
+        let scrollTop = el.scrollTop;
+        const prev = pdfZoomAnchorRef.current;
+        if (prev && prev.oldScale > 0 && Math.abs(prev.newScale - oldScale) < 1e-3) {
+          const prevRatio = prev.newScale / prev.oldScale;
+          scrollLeft = prev.contentX * prevRatio + sizerOffsetLeft - prev.mouseX;
+          scrollTop = prev.contentY * prevRatio - prev.mouseY;
+        }
+
+        const contentX = scrollLeft + mouseX - sizerOffsetLeft;
+        const contentY = scrollTop + mouseY;
+        // Defer DOM transform/scroll to useLayoutEffect so transform + pan are committed together.
+        pdfZoomAnchorRef.current = { mouseX, mouseY, contentX, contentY, oldScale, newScale };
+      } else {
+        pdfZoomAnchorRef.current = null;
+      }
+
+      pdfFitScaleRef.current = null;
+      pdfScaleRef.current = newScale;
+      setPdfFitWidth(false);
+      setPdfScale(newScale);
+    },
+    []
+  );
+
   const zoomPdf = useCallback(
     (delta: number) => {
-      const base = pdfFitScale ?? pdfScale;
-      setPdfFitWidth(false);
-      setPdfScale(clampPdfScale(base + delta));
+      const base = pdfFitWidthRef.current && pdfFitScaleRef.current != null
+        ? pdfFitScaleRef.current
+        : pdfScaleRef.current;
+      const nextScale = clampPdfScale(base + delta);
+      applyPdfScaleWithAnchor(nextScale);
     },
-    [clampPdfScale, pdfFitScale, pdfScale]
+    [applyPdfScaleWithAnchor, clampPdfScale]
   );
+
+  // Cursor-focused Ctrl+Wheel zoom
+  useEffect(() => {
+    const el = pdfContainerRef.current;
+    if (!el) return;
+    const handleWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+
+        const rect = el.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        const base = pdfFitWidthRef.current && pdfFitScaleRef.current != null
+          ? pdfFitScaleRef.current
+          : pdfScaleRef.current;
+        const delta = e.deltaY > 0 ? -0.1 : 0.1;
+        const newScale = clampPdfScale(base + delta);
+        if (newScale === base) return;
+
+        applyPdfScaleWithAnchor(newScale, { mouseX, mouseY });
+      }
+    };
+    el.addEventListener('wheel', handleWheel, { passive: false });
+    return () => el.removeEventListener('wheel', handleWheel);
+  }, [applyPdfScaleWithAnchor, clampPdfScale, pdfUrl]);
 
   const scrollToPdfPage = useCallback((page: number) => {
     const container = pdfContainerRef.current;
@@ -4375,7 +4655,7 @@ export default function EditorPage() {
             ) : activeSidebar === 'agent' ? (
               <>
                 <div className="panel-header">
-                  <div>{assistantMode === 'chat' ? t('Chat') : t('Agent')}</div>
+                  <div className="panel-header-title">{assistantMode === 'chat' ? t('Chat') : t('Agent')}</div>
                   <div className="panel-actions">
                     <div className="mode-toggle">
                       <button
@@ -5635,10 +5915,25 @@ Be thorough. Read ALL .tex files before reporting. Group findings by category. I
                       <button className="icon-btn" onClick={() => zoomPdf(-0.1)} disabled={!pdfUrl}>−</button>
                       <div className="zoom-label">{pdfScaleLabel}</div>
                       <button className="icon-btn" onClick={() => zoomPdf(0.1)} disabled={!pdfUrl}>＋</button>
-                      <button className="btn ghost small" onClick={() => setPdfFitWidth(true)} disabled={!pdfUrl}>{t('适合宽度')}</button>
                       <button
                         className="btn ghost small"
                         onClick={() => {
+                          pdfZoomAnchorRef.current = null;
+                          pdfFitWidthRef.current = true;
+                          setPdfFitWidth(true);
+                        }}
+                        disabled={!pdfUrl}
+                      >
+                        {t('适合宽度')}
+                      </button>
+                      <button
+                        className="btn ghost small"
+                        onClick={() => {
+                          pdfZoomAnchorRef.current = null;
+                          pdfFitScaleRef.current = null;
+                          pdfFitWidthRef.current = false;
+                          pdfScaleRef.current = 1;
+                          setPdfFitScale(null);
                           setPdfFitWidth(false);
                           setPdfScale(1);
                         }}
@@ -5649,6 +5944,13 @@ Be thorough. Read ALL .tex files before reporting. Group findings by category. I
                     </div>
                     <div className="toolbar-group">
                       <button className="btn ghost small" onClick={downloadPdf} disabled={!pdfUrl}>{t('下载 PDF')}</button>
+                      <button
+                        className={`btn ghost small ${pdfClarityMode === 'sharp' ? 'active' : ''}`}
+                        onClick={() => setPdfClarityMode((prev) => (prev === 'sharp' ? 'smooth' : 'sharp'))}
+                        disabled={!pdfUrl}
+                      >
+                        {pdfClarityMode === 'sharp' ? t('清晰优先') : t('丝滑优先')}
+                      </button>
                       <button
                         className={`btn ghost small ${pdfSpread ? 'active' : ''}`}
                         onClick={() => setPdfSpread((prev) => !prev)}
@@ -5668,7 +5970,7 @@ Be thorough. Read ALL .tex files before reporting. Group findings by category. I
                   {pdfUrl ? (
                     <PdfPreview
                       pdfUrl={pdfUrl}
-                      scale={pdfScale}
+                      scale={effectivePdfScale}
                       fitWidth={pdfFitWidth}
                       spread={pdfSpread}
                       onFitScale={handleFitScale}
@@ -5677,6 +5979,8 @@ Be thorough. Read ALL .tex files before reporting. Group findings by category. I
                       annotateMode={pdfAnnotateMode}
                       onAddAnnotation={addPdfAnnotation}
                       containerRef={pdfContainerRef}
+                      zoomAnchorRef={pdfZoomAnchorRef}
+                      clarityMode={pdfClarityMode}
                       onTextClick={(text) => {
                         const view = cmViewRef.current;
                         if (!view) return;

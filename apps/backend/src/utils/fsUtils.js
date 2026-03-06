@@ -34,7 +34,8 @@ export async function listFilesRecursive(root, rel = '') {
   const items = [];
   for (const entry of entries) {
     if (entry.name === 'project.json' || entry.name === '.compile') continue;
-    const itemRel = path.join(rel, entry.name);
+    let itemRel = path.join(rel, entry.name);
+    itemRel = itemRel.replace(/\\/g, '/');
     const full = path.join(root, itemRel);
     if (entry.isDirectory()) {
       items.push({ path: itemRel, type: 'dir' });
