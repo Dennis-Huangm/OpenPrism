@@ -76,6 +76,11 @@ interface SendPromptOptions {
   modeOverride?: 'chat' | 'agent';
 }
 
+interface ProjectScopedState {
+  projectId: string | null;
+  token: number;
+}
+
 type InlineEdit =
   | { kind: 'new-file' | 'new-folder'; parent: string; value: string }
   | { kind: 'rename'; path: string; value: string };
@@ -1420,6 +1425,7 @@ export default function EditorPage() {
   const activeConvIdRef = useRef<string | null>(null);
   const sendPromptRef = useRef<((options?: SendPromptOptions) => void) | null>(null);
   const assistantModeRef = useRef<'chat' | 'agent'>(assistantMode);
+  const projectStateRef = useRef<ProjectScopedState>({ projectId, token: 0 });
   const conversationsRef = useRef<Conversation[]>([]);
   const pendingRequestRef = useRef<{ mode: 'chat' | 'agent'; conversationId: string } | null>(null);
   const sendInFlightRef = useRef(false);
@@ -1462,24 +1468,36 @@ export default function EditorPage() {
     assistantModeRef.current = assistantMode;
   }, [assistantMode]);
 
+  projectStateRef.current = {
+    projectId,
+    token: projectStateRef.current.projectId === projectId ? projectStateRef.current.token : projectStateRef.current.token + 1
+  };
+
   useEffect(() => {
     conversationsRef.current = conversations;
   }, [conversations]);
 
   /* ── Conversation history lifecycle ── */
   useEffect(() => {
-    if (!projectId) return;
+    setChatMessages([]);
+    setAgentMessages([]);
+    setActiveConversationId(null);
+    activeConvIdRef.current = null;
+    pendingRequestRef.current = null;
+    if (!projectId) {
+      setConversations([]);
+      conversationsRef.current = [];
+      return;
+    }
     const loaded = loadConversations(projectId);
     setConversations(loaded);
+    conversationsRef.current = loaded;
     const latest = loaded.find((c) => c.mode === assistantMode);
     if (latest) {
       setActiveConversationId(latest.id);
       activeConvIdRef.current = latest.id;
       if (latest.mode === 'chat') setChatMessages(latest.messages);
       else setAgentMessages(latest.messages);
-    } else {
-      setActiveConversationId(null);
-      activeConvIdRef.current = null;
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId]);
@@ -1509,7 +1527,7 @@ export default function EditorPage() {
             ? {
                 ...c,
                 messages: msgs.slice(-MAX_MESSAGES),
-                title: generateConversationTitle(msgs, defaultTitle),
+                title: c.title,
                 updatedAt: now
               }
             : c
@@ -3736,6 +3754,7 @@ export default function EditorPage() {
         return;
       }
     }
+    const requestProjectState = projectStateRef.current;
     const requestPrompt = options?.promptOverride ?? prompt;
     const userMsg: Message = { role: 'user', content: requestPrompt || t('(empty)') };
     const setHistory = isChat ? setChatMessages : setAgentMessages;
@@ -3799,6 +3818,12 @@ export default function EditorPage() {
       });
       const replyText = res.reply || t('已生成建议。');
       const persistedHistory = [...nextHistory, { role: 'assistant' as const, content: replyText }];
+      if (
+        projectStateRef.current.projectId !== requestProjectState.projectId ||
+        projectStateRef.current.token !== requestProjectState.token
+      ) {
+        return;
+      }
       persistCurrentConversation(persistedHistory, isChat ? 'chat' : 'agent', {
         conversationId: requestConversationId,
         requestConversationId: requestTargetConversationId,
@@ -3840,6 +3865,12 @@ export default function EditorPage() {
     } catch (err) {
       const errorMessage = t('请求失败: {{error}}', { error: String(err) });
       const persistedHistory = [...nextHistory, { role: 'assistant' as const, content: errorMessage }];
+      if (
+        projectStateRef.current.projectId !== requestProjectState.projectId ||
+        projectStateRef.current.token !== requestProjectState.token
+      ) {
+        return;
+      }
       persistCurrentConversation(persistedHistory, isChat ? 'chat' : 'agent', {
         conversationId: requestConversationId,
         requestConversationId: requestTargetConversationId,
@@ -3895,6 +3926,7 @@ export default function EditorPage() {
     }
     if (!activePath) return;
     setDiagnoseBusy(true);
+    const requestProjectState = projectStateRef.current;
     const requestConversationId = activeConvIdRef.current;
     const requestTargetConversationId = requestConversationId ?? createLocalId();
     const defaultConversationTitle = t('新对话');
@@ -3920,6 +3952,12 @@ export default function EditorPage() {
         content: res.reply || t('已生成编译修复建议。')
       };
       const persistedHistory = [...nextHistory, assistant];
+      if (
+        projectStateRef.current.projectId !== requestProjectState.projectId ||
+        projectStateRef.current.token !== requestProjectState.token
+      ) {
+        return;
+      }
       persistCurrentConversation(persistedHistory, 'agent', {
         conversationId: requestConversationId,
         requestConversationId: requestTargetConversationId,
@@ -3941,6 +3979,12 @@ export default function EditorPage() {
     } catch (err) {
       const errorMessage = t('请求失败: {{error}}', { error: String(err) });
       const persistedHistory = [...nextHistory, { role: 'assistant' as const, content: errorMessage }];
+      if (
+        projectStateRef.current.projectId !== requestProjectState.projectId ||
+        projectStateRef.current.token !== requestProjectState.token
+      ) {
+        return;
+      }
       persistCurrentConversation(persistedHistory, 'agent', {
         conversationId: requestConversationId,
         requestConversationId: requestTargetConversationId,
@@ -4445,6 +4489,7 @@ export default function EditorPage() {
                           onChange={(e) => setRenamingValue(e.target.value)}
                           onBlur={() => handleRenameConversation(activeConv.id, renamingValue)}
                           onKeyDown={(e) => {
+                            if (e.nativeEvent.isComposing) return;
                             if (e.key === 'Enter') { e.currentTarget.blur(); }
                             if (e.key === 'Escape') setRenamingConvId(null);
                           }}
@@ -4483,6 +4528,7 @@ export default function EditorPage() {
                                 onChange={(e) => setRenamingValue(e.target.value)}
                                 onBlur={() => handleRenameConversation(conv.id, renamingValue)}
                                 onKeyDown={(e) => {
+                                  if (e.nativeEvent.isComposing) return;
                                   if (e.key === 'Enter') { e.currentTarget.blur(); }
                                   if (e.key === 'Escape') { e.stopPropagation(); setRenamingConvId(null); }
                                 }}
@@ -4741,6 +4787,7 @@ export default function EditorPage() {
                     value={prompt}
                     onChange={(e) => setPrompt(e.target.value)}
                     onKeyDown={(e) => {
+                      if (e.nativeEvent.isComposing) return;
                       if (e.key === 'Enter' && !e.shiftKey) {
                         e.preventDefault();
                         sendPrompt();
