@@ -70,6 +70,12 @@ interface PendingChange {
   diff: string;
 }
 
+interface SendPromptOptions {
+  promptOverride?: string;
+  historyOverride?: Message[];
+  modeOverride?: 'chat' | 'agent';
+}
+
 type InlineEdit =
   | { kind: 'new-file' | 'new-folder'; parent: string; value: string }
   | { kind: 'rename'; path: string; value: string };
@@ -1611,7 +1617,7 @@ export default function EditorPage() {
   const suppressDirtyRef = useRef(false);
   const typewriterTimerRef = useRef<number | null>(null);
   const activeConvIdRef = useRef<string | null>(null);
-  const sendPromptRef = useRef<(() => void) | null>(null);
+  const sendPromptRef = useRef<((options?: SendPromptOptions) => void) | null>(null);
   const assistantModeRef = useRef<'chat' | 'agent'>(assistantMode);
   const conversationsRef = useRef<Conversation[]>([]);
   const pendingRequestRef = useRef<{ mode: 'chat' | 'agent'; conversationId: string } | null>(null);
@@ -1824,22 +1830,22 @@ export default function EditorPage() {
   }, []);
 
   const handleRetryMessage = useCallback((idx: number) => {
-    const msgs = assistantMode === 'chat' ? chatMessages : agentMessages;
-    const setHistory = assistantMode === 'chat' ? setChatMessages : setAgentMessages;
-    // Find the user message that precedes this assistant message
+    const currentMode = assistantModeRef.current;
+    const msgs = currentMode === 'chat' ? chatMessages : agentMessages;
+    const setHistory = currentMode === 'chat' ? setChatMessages : setAgentMessages;
     let userMsgIdx = idx - 1;
     while (userMsgIdx >= 0 && msgs[userMsgIdx].role !== 'user') userMsgIdx--;
     if (userMsgIdx < 0) return;
     const userPrompt = msgs[userMsgIdx].content;
-    // Remove everything from userMsgIdx onward
     const trimmed = msgs.slice(0, userMsgIdx);
     setHistory(trimmed);
-    // Set prompt and trigger send on next tick
     setPrompt(userPrompt);
-    setTimeout(() => {
-      sendPromptRef.current?.();
-    }, 0);
-  }, [assistantMode, chatMessages, agentMessages]);
+    sendPromptRef.current?.({
+      modeOverride: currentMode,
+      promptOverride: userPrompt,
+      historyOverride: trimmed
+    });
+  }, [agentMessages, chatMessages]);
 
   const handleClearConversation = useCallback(() => {
     if (!window.confirm(t('确定清空当前对话？'))) return;
@@ -3992,10 +3998,11 @@ export default function EditorPage() {
     };
   }, []);
 
-  const sendPrompt = async () => {
+  const sendPrompt = useCallback(async (options?: SendPromptOptions) => {
     if (sendInFlightRef.current) return;
     sendInFlightRef.current = true;
-    const isChat = assistantMode === 'chat';
+    const currentMode = options?.modeOverride ?? assistantModeRef.current;
+    const isChat = currentMode === 'chat';
     const requestMode: 'chat' | 'agent' = isChat ? 'chat' : 'agent';
     const requestConversationId = activeConvIdRef.current;
     const requestTargetConversationId = requestConversationId ?? createLocalId();
@@ -4012,14 +4019,15 @@ export default function EditorPage() {
         return;
       }
     }
-    const userMsg: Message = { role: 'user', content: prompt || t('(empty)') };
+    const requestPrompt = options?.promptOverride ?? prompt;
+    const userMsg: Message = { role: 'user', content: requestPrompt || t('(empty)') };
     const setHistory = isChat ? setChatMessages : setAgentMessages;
-    const history = isChat ? chatMessages : agentMessages;
+    const history = options?.historyOverride ?? (isChat ? chatMessages : agentMessages);
     const nextHistory = [...history, userMsg].slice(-MAX_MESSAGES);
     setHistory(nextHistory);
     setPrompt('');
     try {
-      let effectivePrompt = prompt;
+      let effectivePrompt = requestPrompt;
       let effectiveSelection = selectionText;
       let effectiveContent = editorValue;
       let effectiveCompileLog = compileLog;
@@ -4033,7 +4041,7 @@ export default function EditorPage() {
       }
 
       if (!isChat && task === 'translate') {
-        const note = prompt ? `\n${t('User note')}: ${prompt}` : '';
+        const note = requestPrompt ? `\n${t('User note')}: ${requestPrompt}` : '';
         if (translateScope === 'project') {
           effectiveMode = 'tools';
           effectiveSelection = '';
@@ -4052,8 +4060,8 @@ export default function EditorPage() {
         effectiveMode = 'tools';
         effectiveSelection = '';
         effectiveContent = '';
-        effectivePrompt = prompt
-          ? t('Search arXiv and return 3-5 relevant papers with BibTeX entries. User query: {{query}}', { query: prompt })
+        effectivePrompt = requestPrompt
+          ? t('Search arXiv and return 3-5 relevant papers with BibTeX entries. User query: {{query}}', { query: requestPrompt })
           : t('Search arXiv and return 3-5 relevant papers with BibTeX entries.');
         effectiveTask = 'websearch';
       }
@@ -4144,7 +4152,29 @@ export default function EditorPage() {
     } finally {
       sendInFlightRef.current = false;
     }
-  };
+  }, [
+    activePath,
+    agentMessages,
+    assistantMode,
+    buildProjectContext,
+    chatMessages,
+    compileLog,
+    editorValue,
+    files,
+    llmConfig,
+    mode,
+    persistCurrentConversation,
+    projectId,
+    prompt,
+    searchLlmConfig,
+    selectionRange,
+    selectionText,
+    startTypewriter,
+    t,
+    task,
+    translateScope,
+    translateTarget
+  ]);
 
   sendPromptRef.current = sendPrompt;
 
