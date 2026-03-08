@@ -663,8 +663,7 @@ body {
 .chat-panel .chat-messages,
 .side-panel .chat-messages {
   flex: 1;
-  padding: 12px;
-  padding-bottom: 18px;
+  padding: 24px 12px;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
