@@ -32,7 +32,7 @@ function readAwarenessClients(update) {
 }
 
 function sendMessage(conn, payload) {
-  if (conn.socket.readyState !== 1) return;
+  if (!conn?.socket || conn.socket.readyState !== 1) return;
   conn.socket.send(payload);
 }
 

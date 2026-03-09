@@ -54,7 +54,7 @@ export function registerCollabRoutes(fastify) {
     return { ok: true, diagnostics };
   });
 
-  fastify.get('/api/collab', { websocket: true }, async (conn, req) => {
+  fastify.get('/api/collab', { websocket: true }, async (socket, req) => {
     const { token, projectId, file } = req.query || {};
     const tokenValue = Array.isArray(token) ? token[0] : token;
     const filePath = Array.isArray(file) ? file[0] : file;
@@ -64,43 +64,43 @@ export function registerCollabRoutes(fastify) {
     if (tokenValue) {
       payload = verifyToken(tokenValue);
     } else if (!isLocal) {
-      conn.socket.close(1008, 'Unauthorized');
+      socket.close(1008, 'Unauthorized');
       return;
     }
     const effectiveProjectId = payload?.projectId || projectParam;
     if (!effectiveProjectId || !filePath) {
-      conn.socket.close(1008, 'Missing project or file');
+      socket.close(1008, 'Missing project or file');
       return;
     }
     if (payload && projectParam && payload.projectId !== projectParam) {
-      conn.socket.close(1008, 'Project mismatch');
+      socket.close(1008, 'Project mismatch');
       return;
     }
     if (!payload && !isLocal) {
-      conn.socket.close(1008, 'Unauthorized');
+      socket.close(1008, 'Unauthorized');
       return;
     }
     let projectRoot = '';
     try {
       projectRoot = await getProjectRoot(effectiveProjectId);
     } catch {
-      conn.socket.close(1008, 'Project not found');
+      socket.close(1008, 'Project not found');
       return;
     }
     if (!isTextFile(filePath)) {
-      conn.socket.close(1003, 'Binary file');
+      socket.close(1003, 'Binary file');
       return;
     }
     let absPath = '';
     try {
       absPath = safeJoin(projectRoot, filePath);
     } catch {
-      conn.socket.close(1008, 'Invalid path');
+      socket.close(1008, 'Invalid path');
       return;
     }
     const metaPath = path.join(projectRoot, 'project.json');
     const key = `${effectiveProjectId}:${filePath}`;
     const doc = await getOrCreateDoc({ key, absPath, metaPath });
-    setupConnection(doc, conn.socket);
+    setupConnection(doc, socket);
   });
 }
