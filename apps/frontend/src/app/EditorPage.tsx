@@ -4845,69 +4845,82 @@ export default function EditorPage() {
                     )}
                   </div>
                 )}
-                {assistantMode === 'chat' && (
-                  <div className="context-tags">
-                    <span
-                      className={`context-tag ${includeCurrentFile ? 'active' : ''}`}
-                      onClick={() => setIncludeCurrentFile(!includeCurrentFile)}
-                    >{t('读取当前文件')}</span>
-                    {selectionText && (
-                      <span
-                        className={`context-tag ${includeSelection ? 'active' : ''}`}
-                        onClick={() => setIncludeSelection(!includeSelection)}
-                      >{t('读取选区')}</span>
-                    )}
-                    {compileLog && (
-                      <span
-                        className={`context-tag ${includeCompileLog ? 'active' : ''}`}
-                        onClick={() => setIncludeCompileLog(!includeCompileLog)}
-                      >{t('读取编译日志')}</span>
-                    )}
-                  </div>
-                )}
-                <div className="chat-messages">
-                  {assistantMode === 'chat' && chatMessages.length === 0 && (
-                    <div className="muted">{t('输入问题，进行只读对话。')}</div>
-                  )}
-                  {assistantMode === 'agent' && agentMessages.length === 0 && (
-                    <div className="muted">{t('输入任务描述，生成修改建议。')}</div>
-                  )}
-                  {(() => {
-                    const msgs = assistantMode === 'chat' ? chatMessages : agentMessages;
-                    const lastAssistantIdx = (() => { for (let i = msgs.length - 1; i >= 0; i--) { if (msgs[i].role === 'assistant') return i; } return -1; })();
-                    return msgs.map((msg, idx) => (
-                    <div key={idx} className={`chat-msg ${msg.role}`}>
-                      <div className="role">{msg.role}</div>
-                      <div className={`content ${msg.role === 'assistant' ? 'markdown-body' : ''}`}>
-                        {msg.role === 'assistant' ? (
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
-                        ) : (
-                          msg.content
-                        )}
-                      </div>
-                      {msg.role === 'assistant' && msg.content && (
-                        <div className="msg-actions">
-                          <button
-                            className="msg-action-btn"
-                            onClick={() => handleCopyMessage(msg.content, idx)}
-                            title={t('复制')}
-                          >{copiedMsgIdx === idx ? '\u2713' : '\u2398'}</button>
-                          {idx === lastAssistantIdx && (
-                            <button
-                              className="msg-action-btn"
-                              onClick={() => handleRetryMessage(idx)}
-                              title={t('重新生成')}
-                            >&#x21BB;</button>
-                          )}
+                {(() => {
+                  const isChatMode = assistantMode === 'chat';
+                  const msgs = isChatMode ? chatMessages : agentMessages;
+                  const lastAssistantIdx = (() => { for (let i = msgs.length - 1; i >= 0; i--) { if (msgs[i].role === 'assistant') return i; } return -1; })();
+                  const emptyTitle = isChatMode
+                    ? t('围绕当前上下文开始对话')
+                    : t('描述你希望智能体协助的修改任务');
+                  const emptyDescription = isChatMode
+                    ? t('可结合当前文件、选区或编译日志进行解释、分析与只读问答。')
+                    : t('说明目标、约束或期望输出，系统会基于现有工程生成修改建议。');
+                  return (
+                    <div className={`chat-messages ${msgs.length === 0 ? 'is-empty' : ''}`}>
+                      {msgs.length === 0 && (
+                        <div className="chat-empty-state">
+                          <div className="chat-empty-kicker">{isChatMode ? t('只读对话') : t('任务建议')}</div>
+                          <div className="chat-empty-title">{emptyTitle}</div>
+                          <div className="chat-empty-desc">{emptyDescription}</div>
                         </div>
                       )}
+                      {msgs.map((msg, idx) => (
+                        <div key={idx} className={`chat-msg ${msg.role}`}>
+                          <div className="role">{msg.role}</div>
+                          <div className={`content ${msg.role === 'assistant' ? 'markdown-body' : ''}`}>
+                            {msg.role === 'assistant' ? (
+                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+                            ) : (
+                              msg.content
+                            )}
+                          </div>
+                          {msg.role === 'assistant' && msg.content && (
+                            <div className="msg-actions">
+                              <button
+                                className="msg-action-btn"
+                                onClick={() => handleCopyMessage(msg.content, idx)}
+                                title={t('复制')}
+                              >{copiedMsgIdx === idx ? '\u2713' : '\u2398'}</button>
+                              {idx === lastAssistantIdx && (
+                                <button
+                                  className="msg-action-btn"
+                                  onClick={() => handleRetryMessage(idx)}
+                                  title={t('重新生成')}
+                                >&#x21BB;</button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      ))}
                     </div>
-                    ));
-                  })()}
-                </div>
+                  );
+                })()}
                 <div className="chat-controls">
-                  <div className="row chat-control-row">
-                    {assistantMode === 'agent' ? (
+                  {assistantMode === 'chat' && (
+                    <div className="chat-context-meta">
+                      <div className="chat-mode-note">{t('只读对话，不会直接改动文件。')}</div>
+                      <div className="context-tags chat-context-tags">
+                        <span
+                          className={`context-tag ${includeCurrentFile ? 'active' : ''}`}
+                          onClick={() => setIncludeCurrentFile(!includeCurrentFile)}
+                        >{t('读取当前文件')}</span>
+                        {selectionText && (
+                          <span
+                            className={`context-tag ${includeSelection ? 'active' : ''}`}
+                            onClick={() => setIncludeSelection(!includeSelection)}
+                          >{t('读取选区')}</span>
+                        )}
+                        {compileLog && (
+                          <span
+                            className={`context-tag ${includeCompileLog ? 'active' : ''}`}
+                            onClick={() => setIncludeCompileLog(!includeCompileLog)}
+                          >{t('读取编译日志')}</span>
+                        )}
+                      </div>
+                    </div>
+                  )}
+                  {assistantMode === 'agent' && (
+                    <div className="row chat-control-row">
                       <>
                         <div className="ios-select-wrapper">
                           <button
@@ -5001,10 +5014,8 @@ export default function EditorPage() {
                           </span>
                         </div>
                       </>
-                    ) : (
-                      <div className="muted">{t('Chat 模式仅对话，不会改动文件。')}</div>
-                    )}
-                  </div>
+                    </div>
+                  )}
                   {assistantMode === 'agent' && task === 'translate' && (
                     <div className="row chat-control-row">
                       <div className="ios-select-wrapper">
