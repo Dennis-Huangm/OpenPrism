@@ -6,12 +6,12 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { basicSetup } from 'codemirror';
 import { latex } from '../latex/lang';
-import { Compartment, EditorState, StateEffect, StateField } from '@codemirror/state';
+import { Compartment, EditorSelection, EditorState, StateEffect, StateField, Transaction } from '@codemirror/state';
 import { Decoration, EditorView, DecorationSet, WidgetType, keymap, gutter, GutterMarker } from '@codemirror/view';
 import { search, searchKeymap } from '@codemirror/search';
 import { autocompletion, CompletionContext } from '@codemirror/autocomplete';
-import { toggleComment } from '@codemirror/commands';
 import { foldKeymap, foldService, indentOnInput } from '@codemirror/language';
+import { redo } from '@codemirror/commands';
 import { GlobalWorkerOptions, getDocument, renderTextLayer } from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min?url';
 import 'pdfjs-dist/web/pdf_viewer.css';
@@ -1632,6 +1632,56 @@ export default function EditorPage() {
   const acceptSuggestionRef = useRef<() => void>(() => {});
   const acceptChunkRef = useRef<() => void>(() => {});
   const clearSuggestionRef = useRef<() => void>(() => {});
+  const toggleCommentRef = useRef<() => boolean>(() => false);
+
+  const toggleLatexLineComment = useCallback((view: EditorView) => {
+    const ranges = view.state.selection.ranges;
+    const lineNumbers = new Set<number>();
+    ranges.forEach((range) => {
+      const startLine = view.state.doc.lineAt(range.from).number;
+      const endPos = range.to > range.from && range.to > 0 && view.state.doc.lineAt(range.to).from === range.to ? range.to - 1 : range.to;
+      const endLine = view.state.doc.lineAt(endPos).number;
+      for (let lineNo = startLine; lineNo <= endLine; lineNo += 1) {
+        lineNumbers.add(lineNo);
+      }
+    });
+    const lines = Array.from(lineNumbers).sort((a, b) => a - b).map((lineNo) => view.state.doc.line(lineNo));
+    if (lines.length === 0) return false;
+    const nonEmptyLines = lines.filter((line) => line.text.trim().length > 0);
+    const shouldUncomment = nonEmptyLines.length > 0 && nonEmptyLines.every((line) => /^\s*%/.test(line.text));
+    const changes = lines.flatMap((line) => {
+      if (shouldUncomment) {
+        const match = line.text.match(/^(\s*)%\s?/);
+        if (!match) return [];
+        return [{ from: line.from + match[1].length, to: line.from + match[0].length, insert: '' }];
+      }
+      const indentMatch = line.text.match(/^\s*/);
+      const indentLength = indentMatch?.[0].length ?? 0;
+      return [{ from: line.from + indentLength, insert: '% ' }];
+    });
+    if (changes.length === 0) return false;
+    const selection = EditorSelection.create(
+      view.state.selection.ranges.map((range) => {
+        const mapPos = (pos: number) => {
+          let nextPos = pos;
+          changes.forEach((change) => {
+            if (shouldUncomment) {
+              const removed = change.to - change.from;
+              if (nextPos > change.to) nextPos -= removed;
+              else if (nextPos > change.from) nextPos = change.from;
+            } else {
+              if (nextPos >= change.from) nextPos += change.insert.length;
+            }
+          });
+          return nextPos;
+        };
+        return EditorSelection.range(mapPos(range.from), mapPos(range.to));
+      }),
+      view.state.selection.mainIndex
+    );
+    view.dispatch({ changes, selection });
+    return true;
+  }, []);
   const saveActiveFileRef = useRef<() => void>(() => {});
   const gridRef = useRef<HTMLDivElement | null>(null);
   const editorSplitRef = useRef<HTMLDivElement | null>(null);
@@ -2145,18 +2195,15 @@ export default function EditorPage() {
         }
       },
       {
-        key: 'Alt-/',
-        run: () => {
-          requestSuggestionRef.current();
-          return true;
-        }
+        key: 'Mod-Shift-z',
+        run: redo
       },
       {
         key: 'Mod-/',
-        run: toggleComment
+        run: (view) => toggleLatexLineComment(view)
       },
       {
-        key: 'Mod-Space',
+        key: 'Mod-Shift-Space',
         run: () => {
           requestSuggestionRef.current();
           return true;
@@ -2218,18 +2265,36 @@ export default function EditorPage() {
     });
     cmViewRef.current = view;
 
-    const handleAltSlash = (event: KeyboardEvent) => {
-      if (!event.altKey) return;
-      if (event.key === '/' || event.key === '÷' || event.code === 'Slash') {
-        event.preventDefault();
-        event.stopPropagation();
-        requestSuggestionRef.current();
-      }
+    toggleCommentRef.current = () => {
+      const currentView = cmViewRef.current;
+      if (!currentView) return false;
+      return toggleLatexLineComment(currentView);
     };
-    view.dom.addEventListener('keydown', handleAltSlash, true);
+
+    const handleSuggestionShortcut = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target?.closest('.cm-content')) return;
+      const altGraphActive = typeof event.getModifierState === 'function' && event.getModifierState('AltGraph');
+      const isAltSlash = event.altKey && !event.ctrlKey && !event.metaKey && !altGraphActive && (event.key === '/' || event.key === '÷' || event.code === 'Slash');
+      const isCtrlShiftSpace = (event.ctrlKey || event.metaKey) && event.shiftKey && !event.altKey && (event.key === ' ' || event.code === 'Space');
+      const isModSlash = (event.ctrlKey || event.metaKey) && !event.altKey && (event.key === '/' || event.key === '÷' || event.code === 'Slash');
+      if (isModSlash) {
+        const handled = toggleCommentRef.current();
+        if (handled) {
+          event.preventDefault();
+          event.stopPropagation();
+          return;
+        }
+      }
+      if (!isAltSlash && !isCtrlShiftSpace) return;
+      event.preventDefault();
+      event.stopPropagation();
+      requestSuggestionRef.current();
+    };
+    view.dom.addEventListener('keydown', handleSuggestionShortcut, true);
 
     return () => {
-      view.dom.removeEventListener('keydown', handleAltSlash, true);
+      view.dom.removeEventListener('keydown', handleSuggestionShortcut, true);
       view.destroy();
       cmViewRef.current = null;
     };
@@ -2278,8 +2343,15 @@ export default function EditorPage() {
     const current = view.state.doc.toString();
     if (current === value) return;
     suppressDirtyRef.current = true;
+    const selection = view.state.selection.ranges.map((range) => {
+      const anchor = Math.min(range.anchor, value.length);
+      const head = Math.min(range.head, value.length);
+      return EditorSelection.range(anchor, head);
+    });
     view.dispatch({
-      changes: { from: 0, to: current.length, insert: value }
+      changes: { from: 0, to: current.length, insert: value },
+      selection: EditorSelection.create(selection, Math.min(view.state.selection.mainIndex, selection.length - 1)),
+      annotations: [Transaction.addToHistory.of(false)]
     });
   }, []);
 
@@ -5925,7 +5997,7 @@ Be thorough. Read ALL .tex files before reporting. Group findings by category. I
           >
             <div className="editor-area" ref={editorAreaRef}>
               <div ref={editorHostRef} className="editor-host" style={{ '--editor-font-size': `${editorFontSize}px` } as React.CSSProperties} />
-              <div className="editor-hint muted">{t('快捷键: Option/Alt + / 或 Cmd/Ctrl + Space 补全；Cmd/Ctrl + / 注释；Cmd/Ctrl + F 搜索；Cmd/Ctrl + S 保存')}</div>
+              <div className="editor-hint muted">{t('快捷键: Option/Alt + / 或 Cmd/Ctrl + Shift + Space 补全；Cmd/Ctrl + / 注释；Cmd/Ctrl + F 搜索；Cmd/Ctrl + S 保存')}</div>
               {(inlineSuggestionText || isSuggesting) && suggestionPos && (
                 <div
                   className={`suggestion-popover ${isSuggesting && !inlineSuggestionText ? 'loading' : ''}`}
