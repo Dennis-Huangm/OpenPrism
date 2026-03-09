@@ -1,9 +1,20 @@
 import path from 'path';
 
+function normalizeRelativePath(targetPath) {
+  const normalized = String(targetPath || '').replace(/^\/+/, '');
+  if (!normalized) {
+    throw new Error('Invalid path');
+  }
+  return normalized;
+}
+
 export function safeJoin(root, targetPath) {
-  const sanitized = targetPath.replace(/^\/+/, '');
-  const resolved = path.resolve(root, sanitized);
+  const normalized = normalizeRelativePath(targetPath);
+  const resolved = path.resolve(root, normalized);
   if (!resolved.startsWith(root + path.sep) && resolved !== root) {
+    throw new Error('Invalid path');
+  }
+  if (resolved === root) {
     throw new Error('Invalid path');
   }
   return resolved;

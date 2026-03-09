@@ -3,8 +3,20 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+function resolveDataDirPath(value) {
+  if (!value) return path.join(REPO_ROOT, 'data');
+  if (process.platform === 'win32') {
+    const msysMatch = value.match(/^\/([a-zA-Z])\/(.*)$/);
+    if (msysMatch) {
+      const [, drive, rest] = msysMatch;
+      return path.resolve(`${drive.toUpperCase()}:/${rest}`);
+    }
+  }
+  return path.isAbsolute(value) ? value : path.resolve(REPO_ROOT, value);
+}
+
 export const REPO_ROOT = path.resolve(__dirname, '..', '..', '..', '..');
-export const DATA_DIR = path.resolve(REPO_ROOT, process.env.OPENPRISM_DATA_DIR || 'data');
+export const DATA_DIR = resolveDataDirPath(process.env.OPENPRISM_DATA_DIR);
 export const TEMPLATE_DIR = path.join(REPO_ROOT, 'templates');
 export const TEMPLATE_MANIFEST = path.join(TEMPLATE_DIR, 'manifest.json');
 export const PORT = Number(process.env.PORT || 8787);

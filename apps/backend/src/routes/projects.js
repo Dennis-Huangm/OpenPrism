@@ -259,14 +259,25 @@ export function registerProjectRoutes(fastify) {
     const { id } = req.params;
     const projectRoot = await getProjectRoot(id);
     const items = await listFilesRecursive(projectRoot);
+    const knownPaths = new Set(items.map((item) => item.path));
+    const knownDirs = new Set(items.filter((item) => item.type === 'dir').map((item) => item.path));
     let fileOrder = {};
     try {
       const meta = await readJson(path.join(projectRoot, 'project.json'));
       const rawOrder = meta?.fileOrder || {};
       fileOrder = {};
       for (const key in rawOrder) {
-        const normalizedKey = key.replace(/\\/g, '/');
-        fileOrder[normalizedKey] = rawOrder[key].map(p => p.replace(/\\/g, '/'));
+        const normalizedKey =
+          key.includes('\\') && !knownDirs.has(key) && knownDirs.has(key.replace(/\\/g, '/'))
+            ? key.replace(/\\/g, '/')
+            : key;
+        fileOrder[normalizedKey] = rawOrder[key].map((p) => {
+          if (typeof p !== 'string') return p;
+          const normalizedPath = p.replace(/\\/g, '/');
+          return p.includes('\\') && !knownPaths.has(p) && knownPaths.has(normalizedPath)
+            ? normalizedPath
+            : p;
+        });
       }
     } catch {
       fileOrder = {};
