@@ -242,7 +242,8 @@ body {
 }
 
 .panel-header-title {
-  flex: 1 1 auto;
+  flex: 0 0 5ch;
+  inline-size: 5ch;
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
