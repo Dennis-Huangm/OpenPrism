@@ -125,6 +125,18 @@ export default function ProjectPage() {
   // Template upload state
   const templateZipRef = useRef<HTMLInputElement | null>(null);
   const [uploadingTemplate, setUploadingTemplate] = useState(false);
+  const [pendingTemplateUpload, setPendingTemplateUpload] = useState<{
+    file: File;
+    templateId: string;
+    templateLabel: string;
+    entrypoints: string[];
+  } | null>(null);
+  const [pendingTemplateMainFile, setPendingTemplateMainFile] = useState('');
+
+  const closePendingTemplateUpload = () => {
+    setPendingTemplateUpload(null);
+    setPendingTemplateMainFile('');
+  };
 
   const loadProjects = useCallback(async () => {
     const res = await listProjects();
@@ -308,23 +320,39 @@ export default function ProjectPage() {
     }
   };
 
-  const handleUploadTemplate = async (file: File) => {
-    const baseName = file.name.replace(/\.zip$/i, '').replace(/[^a-zA-Z0-9_-]/g, '_');
-    const templateId = baseName.toLowerCase();
-    const templateLabel = baseName;
+  const finishTemplateUpload = async (templateId: string, templateLabel: string, file: File, mainFile?: string) => {
     setUploadingTemplate(true);
     try {
-      await uploadTemplate(templateId, templateLabel, file);
+      await uploadTemplate(templateId, templateLabel, file, mainFile);
       const res = await listTemplates();
       setTemplates(res.templates || []);
       setCategories(res.categories || []);
       setStatus(t('模板上传成功'));
-    } catch (err) {
-      setStatus(t('模板上传失败: {{error}}', { error: String(err) }));
+      closePendingTemplateUpload();
+    } catch (err: any) {
+      if (err?.code === 'MULTIPLE_TEMPLATE_ENTRYPOINTS' && Array.isArray(err?.entrypoints) && err.entrypoints.length > 0) {
+        setPendingTemplateUpload({
+          file,
+          templateId,
+          templateLabel,
+          entrypoints: err.entrypoints,
+        });
+        setPendingTemplateMainFile(err.entrypoints.includes('main.tex') ? 'main.tex' : err.entrypoints[0]);
+        setStatus(t('该模板包含多个主文件，请先选择一个。'));
+      } else {
+        setStatus(t('模板上传失败: {{error}}', { error: String(err) }));
+      }
     } finally {
       setUploadingTemplate(false);
       if (templateZipRef.current) templateZipRef.current.value = '';
     }
+  };
+
+  const handleUploadTemplate = async (file: File) => {
+    const baseName = file.name.replace(/\.zip$/i, '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const templateId = baseName.toLowerCase();
+    const templateLabel = baseName;
+    await finishTemplateUpload(templateId, templateLabel, file);
   };
 
   const handleCopy = async (id: string, originalName: string) => {
@@ -884,6 +912,51 @@ export default function ProjectPage() {
               {galleryTemplates.length === 0 && (
                 <div className="template-gallery-empty">{t('暂无匹配模板')}</div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {pendingTemplateUpload && (
+        <div className="modal-backdrop" onClick={closePendingTemplateUpload}>
+          <div className="modal" onClick={(event) => event.stopPropagation()}>
+            <div className="modal-header">
+              <div>{t('选择模板主文件')}</div>
+              <button className="icon-btn" onClick={closePendingTemplateUpload}>✕</button>
+            </div>
+            <div className="modal-body">
+              <div style={{ fontSize: 13, color: 'var(--muted)', marginBottom: 12 }}>
+                {t('该模板压缩包包含多个可编译入口，请选择上传后默认使用的主文件。')}
+              </div>
+              <div className="field">
+                <label>{t('检测到多个可用主文件，请选择一个')}</label>
+                <div className="ios-select-wrapper">
+                  <select
+                    className="ios-select-trigger"
+                    value={pendingTemplateMainFile}
+                    onChange={(event) => setPendingTemplateMainFile(event.target.value)}
+                  >
+                    {pendingTemplateUpload.entrypoints.map((entrypoint) => (
+                      <option key={entrypoint} value={entrypoint}>{entrypoint}</option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button className="btn ghost" onClick={closePendingTemplateUpload}>{t('取消')}</button>
+              <button
+                className="btn"
+                disabled={uploadingTemplate || !pendingTemplateMainFile}
+                onClick={() => finishTemplateUpload(
+                  pendingTemplateUpload.templateId,
+                  pendingTemplateUpload.templateLabel,
+                  pendingTemplateUpload.file,
+                  pendingTemplateMainFile,
+                )}
+              >
+                {uploadingTemplate ? t('上传中...') : t('确认上传')}
+              </button>
             </div>
           </div>
         </div>

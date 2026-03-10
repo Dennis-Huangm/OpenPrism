@@ -30,6 +30,7 @@ import {
   renamePath,
   deleteFile,
   updateFileOrder,
+  setProjectMainFile,
   runAgent,
   plotFromTable,
   callLLM,
@@ -2127,9 +2128,11 @@ export default function EditorPage() {
     const res = await getProjectTree(projectId);
     setTree(res.items);
     setFileOrder(res.fileOrder || {});
+    setMainFile(res.mainFile || '');
     if (!keepActive || !activePath || !res.items.find((item) => item.path === activePath)) {
-      const main = res.items.find((item) => item.path.endsWith('main.tex'))?.path;
-      const next = main || res.items.find((item) => item.type === 'file')?.path || '';
+      const main = res.mainFile && res.items.find((item) => item.path === res.mainFile)?.path;
+      const legacyMain = res.items.find((item) => item.path.endsWith('main.tex'))?.path;
+      const next = main || legacyMain || res.items.find((item) => item.type === 'file')?.path || '';
       if (next) {
         await openFile(next);
       }
@@ -3292,6 +3295,7 @@ export default function EditorPage() {
           setActivePath('');
           setContent('');
         }
+        await clearMainFileIfDeleted(target);
         // Refresh the file tree
         refreshTree();
       } else {
@@ -3317,6 +3321,7 @@ export default function EditorPage() {
       const entry = tree.find((item) => item.path === from);
       const fromName = from.split('/').pop() || '';
       await renamePath(projectId, from, to);
+      await syncMainFileAfterPathChange(from, to);
       if (activePath === from) {
         setActivePath(to);
         activePathRef.current = to;
@@ -3364,6 +3369,7 @@ export default function EditorPage() {
     const target = folderPath ? `${folderPath}/${fileName}` : fileName;
     if (target === fromPath) return;
     await renamePath(projectId, fromPath, target);
+    await syncMainFileAfterPathChange(fromPath, target);
     if (activePath === fromPath) {
       setActivePath(target);
       activePathRef.current = target;
@@ -3410,6 +3416,38 @@ export default function EditorPage() {
     },
     [projectId, t]
   );
+
+  const syncMainFileAfterPathChange = useCallback(async (fromPath: string, nextPath: string) => {
+    if (!projectId || !mainFile) return;
+    const normalizedMainFile = mainFile.replace(/\\/g, '/');
+    const normalizedFromPath = fromPath.replace(/\\/g, '/');
+    const normalizedNextPath = nextPath.replace(/\\/g, '/');
+    const nextMainFile = normalizedMainFile === normalizedFromPath
+      ? normalizedNextPath
+      : normalizedMainFile.startsWith(`${normalizedFromPath}/`)
+        ? `${normalizedNextPath}${normalizedMainFile.slice(normalizedFromPath.length)}`
+        : '';
+    if (!nextMainFile) return;
+    setMainFile(nextMainFile);
+    try {
+      await setProjectMainFile(projectId, nextMainFile);
+    } catch {
+      // ignore persistence failure and keep local selection
+    }
+  }, [mainFile, projectId]);
+
+  const clearMainFileIfDeleted = useCallback(async (targetPath: string) => {
+    if (!projectId || !mainFile) return;
+    const normalizedMainFile = mainFile.replace(/\\/g, '/');
+    const normalizedTargetPath = targetPath.replace(/\\/g, '/');
+    if (normalizedMainFile !== normalizedTargetPath && !normalizedMainFile.startsWith(`${normalizedTargetPath}/`)) return;
+    setMainFile('');
+    try {
+      await setProjectMainFile(projectId, '');
+    } catch {
+      // ignore persistence failure and keep local selection cleared
+    }
+  }, [mainFile, projectId]);
 
   const filteredTreeItems = useMemo(() => {
     const term = fileFilter.trim().toLowerCase();
@@ -3512,7 +3550,9 @@ export default function EditorPage() {
   useEffect(() => {
     if (texFiles.length === 0) return;
     if (!texFiles.includes(mainFile)) {
-      const preferred = texFiles.find((path) => path.endsWith('main.tex')) || texFiles[0];
+      const preferred = texFiles.find((path) => path === mainFile)
+        || texFiles.find((path) => path.endsWith('main.tex'))
+        || texFiles[0];
       setMainFile(preferred);
     }
   }, [texFiles, mainFile]);
@@ -6350,7 +6390,17 @@ Be thorough. Read ALL .tex files before reporting. Group findings by category. I
       {mainFileDropdownOpen && topBarDropdownRect && (
         <div className="ios-dropdown dropdown-fixed" style={{ top: topBarDropdownRect.top, left: topBarDropdownRect.left, minWidth: topBarDropdownRect.width }}>
           {(texFiles.length > 0 ? texFiles : ['main.tex']).map((p) => (
-            <div key={p} className={`ios-dropdown-item ${mainFile === p ? 'active' : ''}`} onClick={() => { setMainFile(p); setMainFileDropdownOpen(false); }}>
+            <div key={p} className={`ios-dropdown-item ${mainFile === p ? 'active' : ''}`} onClick={async () => {
+              setMainFile(p);
+              setMainFileDropdownOpen(false);
+              if (projectId) {
+                try {
+                  await setProjectMainFile(projectId, p);
+                } catch {
+                  // ignore persistence failure and keep local selection
+                }
+              }
+            }}>
               {p}
               {mainFile === p && <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M3 8L6.5 11.5L13 5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>}
             </div>

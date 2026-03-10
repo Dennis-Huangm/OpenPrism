@@ -44,12 +44,16 @@ export function registerProjectRoutes(fastify) {
     const id = crypto.randomUUID();
     const projectRoot = path.join(DATA_DIR, id);
     await ensureDir(projectRoot);
-    const meta = { id, name, createdAt: new Date().toISOString() };
-    await writeJson(path.join(projectRoot, 'project.json'), meta);
+    let mainFile = '';
     if (template) {
+      const { templates } = await readTemplateManifest();
+      const templateMeta = templates.find((item) => item.id === template);
+      mainFile = templateMeta?.mainFile || '';
       const templateRoot = path.join(TEMPLATE_DIR, template);
       await copyDir(templateRoot, projectRoot);
     }
+    const meta = { id, name, createdAt: new Date().toISOString(), ...(mainFile ? { mainFile } : {}) };
+    await writeJson(path.join(projectRoot, 'project.json'), meta);
     reply.send(meta);
   });
 
@@ -260,9 +264,11 @@ export function registerProjectRoutes(fastify) {
     const projectRoot = await getProjectRoot(id);
     const items = await listFilesRecursive(projectRoot);
     let fileOrder = {};
+    let mainFile = '';
     try {
       const meta = await readJson(path.join(projectRoot, 'project.json'));
       const rawOrder = meta?.fileOrder || {};
+      mainFile = typeof meta?.mainFile === 'string' ? meta.mainFile.replace(/\\/g, '/') : '';
       fileOrder = {};
       for (const key in rawOrder) {
         const normalizedKey = key.replace(/\\/g, '/');
@@ -270,8 +276,9 @@ export function registerProjectRoutes(fastify) {
       }
     } catch {
       fileOrder = {};
+      mainFile = '';
     }
-    return { items, fileOrder };
+    return { items, fileOrder, mainFile };
   });
 
   fastify.post('/api/projects/:id/file-order', async (req) => {
@@ -286,6 +293,39 @@ export function registerProjectRoutes(fastify) {
     const next = { ...meta, fileOrder: { ...(meta.fileOrder || {}), [folder]: order } };
     await writeJson(metaPath, next);
     return { ok: true };
+  });
+
+  fastify.post('/api/projects/:id/main-file', async (req) => {
+    const { id } = req.params;
+    const rawMainFile = req.body?.mainFile;
+    if (typeof rawMainFile !== 'string') {
+      return { ok: false, error: 'Missing mainFile.' };
+    }
+    const mainFile = rawMainFile.replace(/\\/g, '/').trim();
+    const projectRoot = await getProjectRoot(id);
+    const metaPath = path.join(projectRoot, 'project.json');
+    const meta = await readJson(metaPath);
+    if (!mainFile) {
+      const next = { ...meta, mainFile: '', updatedAt: new Date().toISOString() };
+      await writeJson(metaPath, next);
+      return { ok: true, mainFile: '' };
+    }
+    const abs = safeJoin(projectRoot, mainFile);
+    let stat;
+    try {
+      stat = await fs.stat(abs);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        return { ok: false, error: 'Main file not found.' };
+      }
+      throw error;
+    }
+    if (!stat.isFile()) {
+      return { ok: false, error: 'Main file is not a file.' };
+    }
+    const next = { ...meta, mainFile, updatedAt: new Date().toISOString() };
+    await writeJson(metaPath, next);
+    return { ok: true, mainFile: next.mainFile };
   });
 
   fastify.get('/api/projects/:id/file', async (req) => {
@@ -373,7 +413,7 @@ export function registerProjectRoutes(fastify) {
 
   fastify.post('/api/projects/:id/convert-template', async (req) => {
     const { id } = req.params;
-    const { targetTemplate, mainFile = 'main.tex' } = req.body || {};
+    const { targetTemplate, mainFile } = req.body || {};
     if (!targetTemplate) return { ok: false, error: 'Missing targetTemplate' };
     const { templates } = await readTemplateManifest();
     const template = templates.find((item) => item.id === targetTemplate);
@@ -381,7 +421,10 @@ export function registerProjectRoutes(fastify) {
 
     try {
       const projectRoot = await getProjectRoot(id);
-      const currentMainPath = safeJoin(projectRoot, mainFile);
+      const metaPath = path.join(projectRoot, 'project.json');
+      const meta = await readJson(metaPath);
+      const sourceMainFile = typeof mainFile === 'string' && mainFile ? mainFile : (meta.mainFile || 'main.tex');
+      const currentMainPath = safeJoin(projectRoot, sourceMainFile);
       const templateRoot = path.join(TEMPLATE_DIR, template.id);
       const templateMain = template.mainFile || 'main.tex';
       const templateMainPath = path.join(templateRoot, templateMain);
@@ -396,9 +439,10 @@ export function registerProjectRoutes(fastify) {
       const templateTex = await fs.readFile(templateMainPath, 'utf8');
       const body = extractDocumentBody(currentTex);
       const merged = mergeTemplateBody(templateTex, body);
-      const changedFiles = await copyTemplateIntoProject(templateRoot, projectRoot);
+      const changedFiles = await copyTemplateIntoProject(templateRoot, projectRoot, templateMain);
       await fs.writeFile(safeJoin(projectRoot, templateMain), merged, 'utf8');
       changedFiles.push(templateMain);
+      await writeJson(metaPath, { ...meta, mainFile: templateMain, updatedAt: new Date().toISOString() });
       return { ok: true, mainFile: templateMain, changedFiles };
     } catch (err) {
       return { ok: false, error: `Template convert failed: ${String(err)}` };
@@ -410,9 +454,15 @@ export function registerProjectRoutes(fastify) {
     const { template } = req.body || {};
     const projectRoot = await getProjectRoot(id);
     if (!template) return { ok: false };
+    const { templates } = await readTemplateManifest();
+    const templateMeta = templates.find((item) => item.id === template);
+    if (!templateMeta) return { ok: false, error: 'Unknown template' };
     const templateRoot = path.join(TEMPLATE_DIR, template);
     await copyDir(templateRoot, projectRoot);
-    return { ok: true };
+    const metaPath = path.join(projectRoot, 'project.json');
+    const meta = await readJson(metaPath);
+    await writeJson(metaPath, { ...meta, mainFile: templateMeta.mainFile, updatedAt: new Date().toISOString() });
+    return { ok: true, mainFile: templateMeta.mainFile };
   });
 
   fastify.post('/api/projects/:id/folder', async (req) => {

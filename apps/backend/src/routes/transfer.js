@@ -5,7 +5,7 @@ import { buildTransferGraph } from '../services/transferAgent/graph.js';
 import { buildMineruTransferGraph } from '../services/transferAgent/graphMineru.js';
 import { resolveLLMConfig } from '../services/llmService.js';
 import { resolveMineruConfig } from '../services/mineruService.js';
-import { readTemplateManifest } from '../services/templateService.js';
+import { readTemplateManifest, listTemplateEntrypoints } from '../services/templateService.js';
 import { DATA_DIR, TEMPLATE_DIR } from '../config/constants.js';
 import { ensureDir, readJson, writeJson, copyDir } from '../utils/fsUtils.js';
 
@@ -41,6 +41,11 @@ export function registerTransferRoutes(fastify) {
       return reply.code(400).send({ error: `Unknown template: ${targetTemplateId}` });
     }
 
+    const allowedTargetFiles = await listTemplateEntrypoints(targetTemplateId);
+    if (!allowedTargetFiles.includes(targetMainFile)) {
+      return reply.code(400).send({ error: `Invalid targetMainFile for template ${targetTemplateId}: ${targetMainFile}` });
+    }
+
     // Create a new project from the template
     await ensureDir(DATA_DIR);
     const newProjectId = crypto.randomUUID();
@@ -58,6 +63,7 @@ export function registerTransferRoutes(fastify) {
       id: newProjectId,
       name: `${sourceName} (${template.label})`,
       createdAt: new Date().toISOString(),
+      mainFile: targetMainFile,
     };
     await writeJson(path.join(projectRoot, 'project.json'), meta);
 
@@ -125,7 +131,8 @@ export function registerTransferRoutes(fastify) {
         progressLog: job.progressLog,
       };
     } catch (err) {
-      const msg = err?.message || String(err || 'Unknown error');
+      fastify.log.error({ err }, 'transfer step failed');
+      const msg = 'Transfer failed.';
       job.status = 'error';
       job.error = msg;
       return reply.code(500).send({
@@ -221,6 +228,11 @@ export function registerTransferRoutes(fastify) {
       return reply.code(400).send({ error: `Unknown template: ${targetTemplateId}` });
     }
 
+    const allowedTargetFiles = await listTemplateEntrypoints(targetTemplateId);
+    if (!allowedTargetFiles.includes(targetMainFile)) {
+      return reply.code(400).send({ error: `Invalid targetMainFile for template ${targetTemplateId}: ${targetMainFile}` });
+    }
+
     // Create new project from template
     await ensureDir(DATA_DIR);
     const newProjectId = crypto.randomUUID();
@@ -239,6 +251,7 @@ export function registerTransferRoutes(fastify) {
       id: newProjectId,
       name: `${sourceName} (${template.label})`,
       createdAt: new Date().toISOString(),
+      mainFile: targetMainFile,
     };
     await writeJson(path.join(projectRoot, 'project.json'), meta);
 
@@ -322,7 +335,7 @@ export function registerTransferRoutes(fastify) {
     // Set sourcePdfPath in state so compileSource skips compilation
     job.state.sourcePdfPath = pdfPath;
 
-    return { ok: true, pdfPath };
+    return { ok: true };
   });
 
 } // end registerTransferRoutes

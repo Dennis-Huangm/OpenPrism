@@ -7,6 +7,7 @@ import {
   mineruTransferStart,
   mineruTransferUploadPdf,
   listTemplates,
+  listTemplateFiles,
   getProjectTree,
 } from '../api/client';
 import type {
@@ -40,6 +41,10 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
 
   // Target selection
   const [targetTemplateId, setTargetTemplateId] = useState('');
+  const [targetTemplateFiles, setTargetTemplateFiles] = useState<string[]>([]);
+  const [targetMainFile, setTargetMainFile] = useState('');
+  const [targetFileDropdownOpen, setTargetFileDropdownOpen] = useState(false);
+  const [targetFilesError, setTargetFilesError] = useState('');
   const [engine, setEngine] = useState('pdflatex');
   const [layoutCheck, setLayoutCheck] = useState(false);
 
@@ -54,31 +59,7 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
     } catch { return { llmEndpoint: '', llmApiKey: '', llmModel: '' }; }
   };
 
-  const readMineruConfigFromStorage = (): { mineruApiBase: string; mineruToken: string } => {
-    try {
-      const raw = window.localStorage.getItem(SETTINGS_KEY);
-      if (!raw) return { mineruApiBase: '', mineruToken: '' };
-      const p = JSON.parse(raw);
-      return {
-        mineruApiBase: p.mineruApiBase || '',
-        mineruToken: p.mineruToken || '',
-      };
-    } catch { return { mineruApiBase: '', mineruToken: '' }; }
-  };
-
-  const saveMineruConfigToStorage = (apiBase: string, token: string) => {
-    try {
-      const raw = window.localStorage.getItem(SETTINGS_KEY);
-      const p = raw ? JSON.parse(raw) : {};
-      p.mineruApiBase = apiBase;
-      p.mineruToken = token;
-      window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(p));
-    } catch { /* ignore */ }
-  };
-
-  // MinerU API config — initialized from localStorage
-  const [mineruApiBase, setMineruApiBase] = useState(() => readMineruConfigFromStorage().mineruApiBase);
-  const [mineruToken, setMineruToken] = useState(() => readMineruConfigFromStorage().mineruToken);
+  const [mineruToken, setMineruToken] = useState('');
 
   // Dropdown open states
   const [templateDropdownOpen, setTemplateDropdownOpen] = useState(false);
@@ -99,6 +80,7 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
   // Refs for click-outside
   const sourceRef = useRef<HTMLDivElement>(null);
   const templateRef = useRef<HTMLDivElement>(null);
+  const targetFileRef = useRef<HTMLDivElement>(null);
   const engineRef = useRef<HTMLDivElement>(null);
   const modeRef = useRef<HTMLDivElement>(null);
   const pdfInputRef = useRef<HTMLInputElement>(null);
@@ -112,7 +94,8 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
           .map(f => f.path);
         setSourceFiles(texFiles);
         if (texFiles.length > 0) {
-          const main = texFiles.find(f => f === 'main.tex' || f.endsWith('/main.tex'));
+          const configuredMain = res.mainFile && texFiles.includes(res.mainFile) ? res.mainFile : '';
+          const main = configuredMain || texFiles.find(f => f === 'main.tex' || f.endsWith('/main.tex'));
           setSourceMainFile(main || texFiles[0]);
         }
       })
@@ -131,11 +114,48 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
     }
   }, [templatesLoaded]);
 
+  useEffect(() => {
+    if (!targetTemplateId) {
+      setTargetTemplateFiles([]);
+      setTargetMainFile('');
+      setTargetFilesError('');
+      return;
+    }
+
+    setTargetFilesError('');
+
+    let cancelled = false;
+    listTemplateFiles(targetTemplateId)
+      .then((res) => {
+        if (cancelled) return;
+        const files = (res.files || []).slice().sort((a, b) => a.localeCompare(b));
+        setTargetTemplateFiles(files);
+        const selectedTemplate = templates.find((item) => item.id === targetTemplateId);
+        const preferred = selectedTemplate?.mainFile || '';
+        const fallback = files[0] || preferred;
+        setTargetMainFile(() => {
+          if (preferred && files.includes(preferred)) return preferred;
+          return fallback;
+        });
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setTargetTemplateFiles([]);
+        setTargetMainFile('');
+        setTargetFilesError(t('无法加载该模板的主文件列表'));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [targetTemplateId, templates]);
+
   // Click outside to close dropdowns
   useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (sourceRef.current && !sourceRef.current.contains(e.target as Node)) setSourceDropdownOpen(false);
       if (templateRef.current && !templateRef.current.contains(e.target as Node)) setTemplateDropdownOpen(false);
+      if (targetFileRef.current && !targetFileRef.current.contains(e.target as Node)) setTargetFileDropdownOpen(false);
       if (engineRef.current && !engineRef.current.contains(e.target as Node)) setEngineDropdownOpen(false);
       if (modeRef.current && !modeRef.current.contains(e.target as Node)) setModeDropdownOpen(false);
     };
@@ -157,8 +177,7 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
   };
 
   const handleStart = useCallback(async () => {
-    if (!targetTemplateId) return;
-    const targetMainFile = selectedTemplate?.mainFile || 'main.tex';
+    if (!targetTemplateId || !targetMainFile) return;
     setError('');
     setProgressLog([]);
     setRunning(true);
@@ -166,13 +185,8 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
 
     try {
       if (transferMode === 'mineru') {
-        // MinerU mode — persist config to localStorage
-        saveMineruConfigToStorage(mineruApiBase, mineruToken);
-        const mineruConfig = (mineruApiBase || mineruToken)
-          ? {
-            ...(mineruApiBase ? { apiBase: mineruApiBase } : {}),
-            ...(mineruToken ? { token: mineruToken } : {}),
-          }
+        const mineruConfig = mineruToken
+          ? { token: mineruToken }
           : undefined;
 
         const res = await mineruTransferStart({
@@ -216,7 +230,7 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
       setRunning(false);
       setStatus('error');
     }
-  }, [transferMode, mineruSource, uploadedPdf, targetTemplateId, sourceMainFile, projectId, engine, layoutCheck, selectedTemplate, mineruApiBase, mineruToken]);
+  }, [transferMode, mineruSource, uploadedPdf, targetTemplateId, targetMainFile, sourceMainFile, projectId, engine, layoutCheck, selectedTemplate, mineruToken]);
 
   const runGraph = useCallback(async (jid: string) => {
     // eslint-disable-next-line no-constant-condition
@@ -258,7 +272,7 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
   const modeLabel = transferMode === 'mineru' ? 'MinerU (PDF→MD→LaTeX)' : t('经典模式 (LaTeX→LaTeX)');
 
   const canStart = (() => {
-    if (running || !targetTemplateId) return false;
+    if (running || !targetTemplateId || !targetMainFile) return false;
     if (transferMode === 'legacy') return !!sourceMainFile;
     if (transferMode === 'mineru') {
       if (mineruSource === 'project') return !!sourceMainFile;
@@ -406,6 +420,39 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
         </div>
       </div>
 
+      {/* Target main file selection */}
+      <div className="field">
+        <label>{t('目标主文件')}</label>
+        <div className="ios-select-wrapper" ref={targetFileRef}>
+          <button className="ios-select-trigger" onClick={() => setTargetFileDropdownOpen(!targetFileDropdownOpen)} disabled={!targetTemplateId || !!targetFilesError}>
+            <span>{targetMainFile || t('选择目标主文件...')}</span>
+            {chevronSvg(targetFileDropdownOpen)}
+          </button>
+          {targetFileDropdownOpen && (
+            <div className="ios-dropdown dropdown-down">
+              {targetTemplateFiles.map((file) => (
+                <div
+                  key={file}
+                  className={`ios-dropdown-item ${targetMainFile === file ? 'active' : ''}`}
+                  onClick={() => { setTargetMainFile(file); setTargetFileDropdownOpen(false); }}
+                >
+                  {file}
+                  {targetMainFile === file && checkSvg}
+                </div>
+              ))}
+              {targetTemplateFiles.length === 0 && (
+                <div className="ios-dropdown-item" style={{ color: 'var(--muted)', pointerEvents: 'none' }}>
+                  {t('未找到 .tex 文件')}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        {targetFilesError && (
+          <div style={{ fontSize: 12, color: '#d32f2f', marginTop: 6 }}>{targetFilesError}</div>
+        )}
+      </div>
+
       {/* Engine selection */}
       <div className="field">
         <label>{t('编译引擎')}</label>
@@ -432,27 +479,14 @@ export default function TransferPanel({ projectId, onJobUpdate }: TransferPanelP
       </div>
 
       {/* Layout check toggle */}
-      <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12 }}>
-        <input type="checkbox" checked={layoutCheck} onChange={e => setLayoutCheck(e.target.checked)} />
-        {t('启用排版检查 (VLM)')}
+      <label style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 6, marginBottom: 12, opacity: 0.6 }}>
+        <input type="checkbox" checked={layoutCheck} disabled onChange={e => setLayoutCheck(e.target.checked)} />
+        {t('启用排版检查 (VLM)')} {t('(即将支持)')}
       </label>
 
-      {/* MinerU API config — shown only in MinerU mode */}
+      {/* MinerU token — shown only in MinerU mode */}
       {transferMode === 'mineru' && (
         <div style={{ marginBottom: 12 }}>
-          <div className="field">
-            <label>MinerU API</label>
-            <div className="ios-select-wrapper">
-              <input
-                type="text"
-                className="ios-select-trigger"
-                placeholder="https://mineru.net/api/v4"
-                value={mineruApiBase}
-                onChange={e => setMineruApiBase(e.target.value)}
-                style={{ paddingRight: 12 }}
-              />
-            </div>
-          </div>
           <div className="field">
             <label>MinerU Token</label>
             <div className="ios-select-wrapper">
