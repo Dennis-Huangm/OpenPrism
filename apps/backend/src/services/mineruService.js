@@ -1,17 +1,143 @@
 import { promises as fs } from 'fs';
+import net from 'net';
 import path from 'path';
 import { MINERU_API_BASE, MINERU_POLL_INTERVAL_MS, MINERU_MAX_POLL_ATTEMPTS } from '../config/constants.js';
 import { ensureDir } from '../utils/fsUtils.js';
 import { safeJoin } from '../utils/pathUtils.js';
 
 const MINERU_MAX_FILE_BYTES = 200 * 1024 * 1024;
+const MINERU_REQUEST_TIMEOUT_MS = Math.max(1000, Number(process.env.OPENPRISM_MINERU_REQUEST_TIMEOUT_MS) || 120000);
+const MINERU_TRANSFER_TIMEOUT_MS = Math.max(MINERU_REQUEST_TIMEOUT_MS, Number(process.env.OPENPRISM_MINERU_TRANSFER_TIMEOUT_MS) || 600000);
+const MINERU_ALLOWED_HOSTS_ENV = 'OPENPRISM_MINERU_ALLOWED_HOSTS';
+const MINERU_DEFAULT_ALLOWED_HOSTS = [
+  'mineru.net',
+  'mineru.oss-cn-shanghai.aliyuncs.com',
+  'cdn-mineru.openxlab.org.cn',
+];
+
+function withMineruCause(message, cause) {
+  const error = new Error(message);
+  if (cause) {
+    error.cause = cause;
+  }
+  return error;
+}
+
+function createMineruTimeoutError(timeoutMs) {
+  return withMineruCause(`MinerU request timed out after ${timeoutMs}ms`, { timeoutMs });
+}
+
+function getAllowedMineruHosts(apiBase) {
+  const apiHost = new URL(String(apiBase)).host;
+  const configuredHosts = String(process.env[MINERU_ALLOWED_HOSTS_ENV] || '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  return new Set([
+    apiHost.toLowerCase(),
+    ...MINERU_DEFAULT_ALLOWED_HOSTS,
+    ...configuredHosts,
+  ]);
+}
+
+function assertAllowedMineruUrl(url, apiBase) {
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(String(url));
+  } catch {
+    throw new Error('MinerU returned an invalid URL.');
+  }
+
+  if (parsedUrl.protocol !== 'https:') {
+    throw new Error('MinerU returned an unsupported URL protocol.');
+  }
+  if (parsedUrl.username || parsedUrl.password) {
+    throw new Error('MinerU returned a URL with embedded credentials.');
+  }
+  if (net.isIP(parsedUrl.hostname)) {
+    throw new Error('MinerU returned a URL with a disallowed host.');
+  }
+
+  const allowedHosts = getAllowedMineruHosts(apiBase);
+  if (!allowedHosts.has(parsedUrl.host.toLowerCase())) {
+    throw new Error('MinerU returned a URL for an unexpected host.');
+  }
+}
+
+function createRequestTimeout(timeoutMs, upstreamSignal) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let cleanedUp = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
+  return {
+    signal: upstreamSignal ? AbortSignal.any([upstreamSignal, controller.signal]) : controller.signal,
+    timeoutMs,
+    didTimeout: () => timedOut,
+    cleanup: () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      clearTimeout(timeoutId);
+    },
+  };
+}
+
+async function fetchResponseWithTimeout(url, options = {}, timeoutMs = MINERU_REQUEST_TIMEOUT_MS) {
+  const requestTimeout = createRequestTimeout(timeoutMs, options?.signal);
+  try {
+    const response = await fetch(url, { ...options, redirect: 'error', signal: requestTimeout.signal });
+    return { response, requestTimeout };
+  } catch (error) {
+    requestTimeout.cleanup();
+    if (requestTimeout.didTimeout() && error?.name === 'AbortError') {
+      throw createMineruTimeoutError(timeoutMs);
+    }
+    throw error;
+  }
+}
+
+async function readResponseTextWithTimeout({ response, requestTimeout }) {
+  try {
+    return await response.text();
+  } catch (error) {
+    if (requestTimeout.didTimeout() && error?.name === 'AbortError') {
+      throw createMineruTimeoutError(requestTimeout.timeoutMs);
+    }
+    throw error;
+  } finally {
+    requestTimeout.cleanup();
+  }
+}
+
+async function readResponseArrayBufferWithTimeout({ response, requestTimeout }) {
+  try {
+    return await response.arrayBuffer();
+  } catch (error) {
+    if (requestTimeout.didTimeout() && error?.name === 'AbortError') {
+      throw createMineruTimeoutError(requestTimeout.timeoutMs);
+    }
+    throw error;
+  } finally {
+    requestTimeout.cleanup();
+  }
+}
 
 /**
  * Resolve MinerU configuration from request config or environment variables.
- * apiBase can be overridden by the frontend; falls back to MINERU_API_BASE constant.
+ * apiBase is controlled server-side and cannot be overridden by the frontend.
  */
 export function resolveMineruConfig(mineruConfig) {
-  const rawBase = (mineruConfig?.apiBase || process.env.OPENPRISM_MINERU_API_BASE || MINERU_API_BASE).trim();
+  if (mineruConfig?.apiBase) {
+    throw new Error('MinerU apiBase override is not supported. Configure OPENPRISM_MINERU_API_BASE on the server.');
+  }
+  if (mineruConfig?.callback) {
+    throw new Error('MinerU callback is not supported.');
+  }
+
+  const rawBase = (process.env.OPENPRISM_MINERU_API_BASE || MINERU_API_BASE).trim();
   const rawExtraFormats = Array.isArray(mineruConfig?.extraFormats) ? mineruConfig.extraFormats : [];
   const extraFormats = rawExtraFormats
     .map(v => String(v || '').trim().toLowerCase())
@@ -27,7 +153,7 @@ export function resolveMineruConfig(mineruConfig) {
     language: typeof mineruConfig?.language === 'string' ? mineruConfig.language.trim() : '',
     pageRanges: typeof mineruConfig?.pageRanges === 'string' ? mineruConfig.pageRanges.trim() : '',
     dataId: typeof mineruConfig?.dataId === 'string' ? mineruConfig.dataId.trim() : '',
-    callback: typeof mineruConfig?.callback === 'string' ? mineruConfig.callback.trim() : '',
+    callback: '',
     seed: typeof mineruConfig?.seed === 'string' ? mineruConfig.seed.trim() : '',
     extraFormats,
   };
@@ -55,7 +181,7 @@ async function requestUploadUrl(apiBase, token, fileName, modelVersion, options 
   if (options.seed) payload.seed = options.seed;
   if (options.extraFormats?.length) payload.extra_formats = options.extraFormats;
 
-  const res = await fetch(url, {
+  const result = await fetchResponseWithTimeout(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -64,9 +190,9 @@ async function requestUploadUrl(apiBase, token, fileName, modelVersion, options 
     body: JSON.stringify(payload),
   });
 
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`MinerU requestUploadUrl failed (${res.status}): ${text}`);
+  const text = await readResponseTextWithTimeout(result);
+  if (!result.response.ok) {
+    throw withMineruCause(`MinerU requestUploadUrl failed (${result.response.status})`, { status: result.response.status });
   }
 
   let data;
@@ -77,7 +203,7 @@ async function requestUploadUrl(apiBase, token, fileName, modelVersion, options 
   }
 
   if (data.code !== 0) {
-    throw new Error(`MinerU requestUploadUrl error: ${data.msg || JSON.stringify(data)}`);
+    throw withMineruCause('MinerU requestUploadUrl error');
   }
 
   const batchId = data.data?.batch_id;
@@ -86,6 +212,7 @@ async function requestUploadUrl(apiBase, token, fileName, modelVersion, options 
     throw new Error('MinerU requestUploadUrl: missing batch_id or file_urls');
   }
 
+  assertAllowedMineruUrl(fileUrls[0], apiBase);
   return { batchId, uploadUrl: fileUrls[0] };
 }
 
@@ -93,15 +220,16 @@ async function requestUploadUrl(apiBase, token, fileName, modelVersion, options 
  * Upload PDF buffer to the presigned URL.
  */
 async function uploadPdfToMineru(uploadUrl, pdfBuffer) {
-  const res = await fetch(uploadUrl, {
+  const result = await fetchResponseWithTimeout(uploadUrl, {
     method: 'PUT',
     body: pdfBuffer,
-  });
+  }, MINERU_TRANSFER_TIMEOUT_MS);
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`MinerU upload failed (${res.status}): ${text}`);
+  if (!result.response.ok) {
+    const text = await readResponseTextWithTimeout(result);
+    throw withMineruCause(`MinerU upload failed (${result.response.status})`, { status: result.response.status });
   }
+  result.requestTimeout.cleanup();
 }
 
 /**
@@ -116,11 +244,11 @@ async function pollMineruResult(apiBase, token, batchId, onProgress) {
   };
 
   for (let attempt = 0; attempt < MINERU_MAX_POLL_ATTEMPTS; attempt++) {
-    const res = await fetch(url, { headers });
-    const text = await res.text();
+    const pollResponse = await fetchResponseWithTimeout(url, { headers });
+    const text = await readResponseTextWithTimeout(pollResponse);
 
-    if (!res.ok) {
-      throw new Error(`MinerU poll failed (${res.status}): ${text}`);
+    if (!pollResponse.response.ok) {
+      throw withMineruCause(`MinerU poll failed (${pollResponse.response.status})`, { status: pollResponse.response.status });
     }
 
     let data;
@@ -131,7 +259,7 @@ async function pollMineruResult(apiBase, token, batchId, onProgress) {
     }
 
     if (data.code !== 0) {
-      throw new Error(`MinerU poll error: ${data.msg || JSON.stringify(data)}`);
+      throw withMineruCause('MinerU poll error');
     }
 
     const results = data.data?.extract_result;
@@ -155,11 +283,12 @@ async function pollMineruResult(apiBase, token, batchId, onProgress) {
       if (!result.full_zip_url) {
         throw new Error('MinerU: task done but no full_zip_url');
       }
+      assertAllowedMineruUrl(result.full_zip_url, apiBase);
       return { zipUrl: result.full_zip_url };
     }
 
     if (state === 'failed') {
-      throw new Error(`MinerU extraction failed: ${result.err_msg || 'unknown error'}`);
+      throw withMineruCause('MinerU extraction failed');
     }
 
     // Still processing: pending, running, converting, waiting-file
@@ -186,12 +315,13 @@ async function downloadAndExtractZip(zipUrl, outputDir) {
   await ensureDir(outputDir);
 
   // Download zip
-  const res = await fetch(zipUrl);
-  if (!res.ok) {
-    throw new Error(`Failed to download MinerU zip (${res.status})`);
+  const result = await fetchResponseWithTimeout(zipUrl, {}, MINERU_TRANSFER_TIMEOUT_MS);
+  if (!result.response.ok) {
+    const text = await readResponseTextWithTimeout(result);
+    throw withMineruCause(`Failed to download MinerU zip (${result.response.status})`, { status: result.response.status });
   }
 
-  const arrayBuffer = await res.arrayBuffer();
+  const arrayBuffer = await readResponseArrayBufferWithTimeout(result);
   const zipBuffer = Buffer.from(arrayBuffer);
 
   // Extract zip to outputDir
@@ -224,12 +354,14 @@ async function downloadAndExtractZip(zipUrl, outputDir) {
  *     <name>_content_list.json (or similar)
  */
 async function parseExtractedOutput(outputDir) {
-  const markdownPath = await findFirstFileRecursive(outputDir, p => p.toLowerCase().endsWith('.md'));
-  if (!markdownPath) {
+  const markdownCandidates = await findFilesRecursive(outputDir, (filePath) => filePath.toLowerCase().endsWith('.md'));
+  const markdownMatch = await chooseBestMarkdownFile(markdownCandidates);
+  if (!markdownMatch?.path) {
     throw new Error('MinerU output missing markdown file');
   }
+  const markdownPath = markdownMatch.path;
   const searchDir = path.dirname(markdownPath);
-  const markdownContent = await fs.readFile(markdownPath, 'utf8');
+  const markdownContent = markdownMatch.content;
   if (!markdownContent.trim()) {
     throw new Error('MinerU output missing markdown content');
   }
@@ -245,21 +377,62 @@ async function parseExtractedOutput(outputDir) {
     images.push(...fallback);
   }
 
-  return { markdownContent, images, searchDir };
+  return {
+    markdownContent,
+    images,
+    searchDir,
+    markdownPath,
+    selectionReason: markdownMatch.reason,
+  };
 }
 
-async function findFirstFileRecursive(rootDir, predicate) {
+async function findFilesRecursive(rootDir, predicate) {
+  const out = [];
   const entries = await fs.readdir(rootDir, { withFileTypes: true });
   for (const entry of entries) {
     const abs = path.join(rootDir, entry.name);
-    if (entry.isFile() && predicate(abs)) return abs;
-  }
-  for (const entry of entries) {
+    if (entry.isFile()) {
+      if (predicate(abs)) out.push(abs);
+      continue;
+    }
     if (!entry.isDirectory()) continue;
-    const found = await findFirstFileRecursive(path.join(rootDir, entry.name), predicate);
-    if (found) return found;
+    out.push(...await findFilesRecursive(abs, predicate));
   }
-  return '';
+  return out;
+}
+
+async function chooseBestMarkdownFile(markdownPaths) {
+  if (!Array.isArray(markdownPaths) || markdownPaths.length === 0) return null;
+
+  const matches = [];
+  for (const filePath of markdownPaths) {
+    const content = await fs.readFile(filePath, 'utf8');
+    const trimmed = content.trim();
+    matches.push({
+      path: filePath,
+      content,
+      size: Buffer.byteLength(content, 'utf8'),
+      isFull: path.basename(filePath).toLowerCase() === 'full.md',
+      isNonEmpty: trimmed.length > 0,
+    });
+  }
+
+  const preferredFull = matches
+    .filter((item) => item.isFull && item.isNonEmpty)
+    .sort((a, b) => b.size - a.size)[0];
+  if (preferredFull) {
+    return { path: preferredFull.path, content: preferredFull.content, reason: 'preferred full.md' };
+  }
+
+  const largestNonEmpty = matches
+    .filter((item) => item.isNonEmpty)
+    .sort((a, b) => b.size - a.size)[0];
+  if (largestNonEmpty) {
+    return { path: largestNonEmpty.path, content: largestNonEmpty.content, reason: 'largest non-empty markdown file' };
+  }
+
+  const first = matches.sort((a, b) => a.path.localeCompare(b.path))[0];
+  return first ? { path: first.path, content: first.content, reason: 'first markdown file fallback' } : null;
 }
 
 function isImageFilePath(filePath) {

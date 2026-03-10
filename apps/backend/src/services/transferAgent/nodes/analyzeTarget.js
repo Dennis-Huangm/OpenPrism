@@ -8,10 +8,11 @@ import { listFilesRecursive } from '../../../utils/fsUtils.js';
  * Recursively resolve \input{} and \include references.
  */
 async function resolveInputs(projectRoot, relPath, visited = new Set()) {
-  if (visited.has(relPath)) return '';
-  visited.add(relPath);
+  const normalizedRelPath = path.normalize(relPath).replace(/\\/g, '/');
+  if (visited.has(normalizedRelPath)) return '';
+  visited.add(normalizedRelPath);
 
-  const absPath = safeJoin(projectRoot, relPath);
+  const absPath = safeJoin(projectRoot, normalizedRelPath);
   let content;
   try {
     content = await fs.readFile(absPath, 'utf8');
@@ -28,7 +29,8 @@ async function resolveInputs(projectRoot, relPath, visited = new Set()) {
     result += content.slice(lastIndex, match.index);
     let ref = match[1].trim();
     if (!path.extname(ref)) ref += '.tex';
-    const childContent = await resolveInputs(projectRoot, ref, visited);
+    const resolvedRef = path.normalize(path.join(path.dirname(normalizedRelPath), ref)).replace(/\\/g, '/');
+    const childContent = await resolveInputs(projectRoot, resolvedRef, visited);
     result += childContent;
     lastIndex = pattern.lastIndex;
   }
@@ -65,8 +67,28 @@ function parseOutline(content) {
  */
 export async function analyzeTarget(state) {
   const projectRoot = await getProjectRoot(state.targetProjectId);
+  const targetMainFile = state.targetMainFile;
 
-  const fullContent = await resolveInputs(projectRoot, state.targetMainFile);
+  if (!targetMainFile) {
+    throw new Error('Target main file is required.');
+  }
+
+  const rootMainPath = safeJoin(projectRoot, targetMainFile);
+  let rootContent = '';
+  try {
+    rootContent = await fs.readFile(rootMainPath, 'utf8');
+  } catch {
+    throw new Error(`Target main file not found: ${targetMainFile}`);
+  }
+  if (!rootContent.trim()) {
+    throw new Error(`Target main file is empty: ${targetMainFile}`);
+  }
+
+  const fullContent = await resolveInputs(projectRoot, targetMainFile);
+  if (!fullContent.trim()) {
+    throw new Error(`Resolved target template is empty: ${targetMainFile}`);
+  }
+
   const preamble = extractPreamble(fullContent);
   const outline = parseOutline(fullContent);
 
@@ -75,6 +97,6 @@ export async function analyzeTarget(state) {
     targetOutline: outline,
     targetPreamble: preamble,
     targetTemplateContent: fullContent,
-    progressLog: `[analyzeTarget] Template has ${outline.length} sections. Preamble length: ${preamble.length} chars.`,
+    progressLog: `[analyzeTarget] Using ${targetMainFile}. Template has ${outline.length} sections. Preamble length: ${preamble.length} chars.`,
   };
 }

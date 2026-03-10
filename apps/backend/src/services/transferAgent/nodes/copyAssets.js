@@ -78,17 +78,27 @@ async function copyAssetsLegacy(state) {
 async function copyAssetsMineru(state) {
   const images = state.sourceImages || [];
   let copiedCount = 0;
+  let renamedCount = 0;
 
   // Copy MinerU-extracted images to target project images/
   const imagesDir = path.join(state.targetProjectRoot, 'images');
   await ensureDir(imagesDir);
 
+  const usedNames = new Set();
   for (const img of images) {
-    const destPath = path.join(imagesDir, img.name);
-    if (await fileExists(img.localPath)) {
-      await fs.copyFile(img.localPath, destPath);
-      copiedCount++;
+    if (!(await fileExists(img.localPath))) continue;
+
+    const plannedName = img.name || path.basename(img.localPath);
+    const finalName = `${plannedName}`;
+    if (usedNames.has(finalName) || await fileExists(path.join(imagesDir, finalName))) {
+      throw new Error(`Duplicate MinerU image target name: ${finalName}`);
     }
+
+    const destPath = path.join(imagesDir, finalName);
+    await fs.copyFile(img.localPath, destPath);
+    usedNames.add(finalName);
+    copiedCount++;
+    if (finalName !== (img.originalName || plannedName)) renamedCount++;
   }
 
   // Copy bib files from source project if available
@@ -111,7 +121,7 @@ async function copyAssetsMineru(state) {
   }
 
   return {
-    progressLog: `[copyAssets:mineru] Copied ${copiedCount} images, ${bibCount} bib files.`,
+    progressLog: `[copyAssets:mineru] Copied ${copiedCount} images (${renamedCount} renamed), ${bibCount} bib files.`,
   };
 }
 

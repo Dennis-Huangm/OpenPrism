@@ -16,7 +16,7 @@ export async function compileSource(state) {
   if (state.sourcePdfPath) {
     return {
       sourceProjectRoot,
-      progressLog: `[compileSource] Using provided PDF: ${state.sourcePdfPath}`,
+      progressLog: `[compileSource] Using provided PDF: ${path.basename(state.sourcePdfPath)}`,
     };
   }
   if (!state.sourceProjectId || !state.sourceMainFile) {
@@ -45,6 +45,6 @@ export async function compileSource(state) {
   return {
     sourcePdfPath: pdfPath,
     sourceProjectRoot,
-    progressLog: `[compileSource] Compiled source project to PDF (${pdfPath}).`,
+    progressLog: `[compileSource] Compiled source project to PDF (${path.basename(pdfPath)}).`,
   };
 }

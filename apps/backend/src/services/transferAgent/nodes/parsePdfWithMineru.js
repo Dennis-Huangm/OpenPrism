@@ -1,3 +1,4 @@
+import { promises as fs } from 'fs';
 import path from 'path';
 import { parsePdfWithMineru as callMineru } from '../../mineruService.js';
 import { ensureDir } from '../../../utils/fsUtils.js';
@@ -18,14 +19,41 @@ export async function parsePdfWithMineru(state) {
     outputDir,
   );
 
+  const normalizedImages = [];
+  const usedNames = new Set();
+  const imagesDir = path.join(targetProjectRoot, 'images');
+  await ensureDir(imagesDir);
+  for (const image of (result.images || [])) {
+    const rawName = image?.name || path.basename(image?.localPath || 'image');
+    const parsed = path.parse(rawName);
+    let finalName = `${parsed.name}${parsed.ext}`;
+    let suffix = 1;
+    while (usedNames.has(finalName)) {
+      finalName = `${parsed.name}-${suffix}${parsed.ext}`;
+      suffix += 1;
+    }
+    while (true) {
+      try {
+        await fs.access(path.join(imagesDir, finalName));
+        finalName = `${parsed.name}-${suffix}${parsed.ext}`;
+        suffix += 1;
+      } catch {
+        break;
+      }
+    }
+    usedNames.add(finalName);
+    normalizedImages.push({ ...image, name: finalName, originalName: rawName });
+  }
+
   const mdLen = (result.markdownContent || '').length;
-  const imgCount = (result.images || []).length;
+  const imgCount = normalizedImages.length;
+  const markdownRef = result.markdownPath ? path.basename(result.markdownPath) : 'markdown file';
 
   return {
     sourceMarkdown: result.markdownContent,
-    sourceImages: result.images || [],
+    sourceImages: normalizedImages,
     targetProjectRoot,
     mineruOutputDir: outputDir,
-    progressLog: `[parsePdfWithMineru] Parsed PDF: ${mdLen} chars markdown, ${imgCount} images.`,
+    progressLog: `[parsePdfWithMineru] Parsed PDF: ${mdLen} chars markdown, ${imgCount} images. Selected ${markdownRef} (${result.selectionReason || 'default selection'}).`,
   };
 }
