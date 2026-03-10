@@ -30,15 +30,42 @@ export async function runToolAgent({
 
   const projectRoot = await getProjectRoot(projectId);
   const pendingPatches = [];
+  const READ_FILE_MAX_CHARS = Math.max(1000, Number(process.env.OPENPRISM_TOOL_READ_MAX_CHARS) || 8000);
+  const LIST_FILES_MAX_COUNT = Math.max(50, Number(process.env.OPENPRISM_TOOL_LIST_MAX_COUNT) || 400);
 
   const readFileTool = new DynamicStructuredTool({
     name: 'read_file',
-    description: 'Read a UTF-8 file from the project. Input: { path } (relative to project root).',
-    schema: z.object({ path: z.string() }),
-    func: async ({ path: filePath }) => {
+    description: 'Read a UTF-8 file from the project. Input: { path, startLine?, endLine? } (relative to project root).',
+    schema: z.object({
+      path: z.string(),
+      startLine: z.number().int().min(1).optional(),
+      endLine: z.number().int().min(1).optional()
+    }),
+    func: async ({ path: filePath, startLine, endLine }) => {
       const abs = safeJoin(projectRoot, filePath);
       const content = await fs.readFile(abs, 'utf8');
-      return content.slice(0, 20000);
+      const lines = content.split(/\r\n|\r|\n/);
+      const lineBreaks = content.match(/\r\n|\r|\n/g) || [];
+      const totalLines = lines.length;
+      const start = Math.max(1, Math.min(startLine || 1, totalLines));
+      const end = Math.max(start, Math.min(endLine || totalLines, totalLines));
+      let selected = '';
+      for (let index = start - 1; index < end; index += 1) {
+        selected += lines[index] || '';
+        if (index < end - 1 && index < lineBreaks.length) {
+          selected += lineBreaks[index];
+        }
+      }
+      if (selected.length <= READ_FILE_MAX_CHARS) {
+        return `[read_file] ${filePath} lines ${start}-${end} of ${totalLines}\n${selected}`;
+      }
+      const truncated = selected.slice(0, READ_FILE_MAX_CHARS);
+      return [
+        `[read_file] ${filePath} lines ${start}-${end} of ${totalLines} (truncated to ${READ_FILE_MAX_CHARS} chars)`,
+        truncated,
+        `\n...[truncated ${selected.length - READ_FILE_MAX_CHARS} chars]`,
+        'If needed, call read_file again with a narrower line range.'
+      ].join('\n');
     }
   });
 
@@ -49,8 +76,16 @@ export async function runToolAgent({
     func: async ({ dir }) => {
       const root = dir ? safeJoin(projectRoot, dir) : projectRoot;
       const items = await listFilesRecursive(root, '');
-      const files = items.filter((item) => item.type === 'file').map((item) => item.path);
-      return JSON.stringify({ files });
+      const files = items
+        .filter((item) => item.type === 'file')
+        .map((item) => item.path)
+        .sort();
+      const limited = files.slice(0, LIST_FILES_MAX_COUNT);
+      return JSON.stringify({
+        files: limited,
+        total: files.length,
+        truncated: files.length > limited.length
+      });
     }
   });
 
@@ -186,7 +221,12 @@ export async function runToolAgent({
 
   const tools = [readFileTool, listFilesTool, proposePatchTool, applyPatchTool, compileLogTool, arxivSearchTool, arxivBibtexTool];
   const agent = await createOpenAIToolsAgent({ llm, tools, prompt: promptTemplate });
-  const executor = new AgentExecutor({ agent, tools });
+  const executor = new AgentExecutor({
+    agent,
+    tools,
+    maxIterations: Math.max(2, Number(process.env.OPENPRISM_TOOL_AGENT_MAX_ITERATIONS) || 6),
+    earlyStoppingMethod: 'force'
+  });
   const result = await executor.invoke({ input: userInput });
 
   return {

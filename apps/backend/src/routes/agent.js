@@ -2,6 +2,182 @@ import { callOpenAICompatible } from '../services/llmService.js';
 import { runToolAgent } from '../services/agentService.js';
 import { getLang, t } from '../i18n/index.js';
 
+function stripCodeFence(text) {
+  const raw = String(text || '').trim();
+  if (!raw.startsWith('```')) return raw;
+  return raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+}
+
+function tryParseReplyPayload(text) {
+  const raw = stripCodeFence(text);
+  if (!raw) return null;
+  const candidates = [raw];
+  const first = raw.indexOf('{');
+  const last = raw.lastIndexOf('}');
+  if (first >= 0 && last > first) {
+    candidates.push(raw.slice(first, last + 1));
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === 'object') return parsed;
+    } catch {
+      // ignore invalid JSON-like payloads
+    }
+  }
+  return null;
+}
+
+function decodeEscapedChar(ch) {
+  switch (ch) {
+    case 'n': return '\n';
+    case 'r': return '\r';
+    case 't': return '\t';
+    case 'b': return '\b';
+    case 'f': return '\f';
+    case '"': return '"';
+    case '\'': return '\'';
+    case '\\': return '\\';
+    case '/': return '/';
+    default: return ch;
+  }
+}
+
+function parseQuotedString(text, quote, startIndex) {
+  let i = startIndex;
+  let out = '';
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '\\') {
+      const next = text[i + 1];
+      if (next === 'u' && /^[0-9a-fA-F]{4}$/.test(text.slice(i + 2, i + 6))) {
+        out += String.fromCharCode(Number.parseInt(text.slice(i + 2, i + 6), 16));
+        i += 6;
+        continue;
+      }
+      if (next) {
+        out += decodeEscapedChar(next);
+        i += 2;
+        continue;
+      }
+      i += 1;
+      continue;
+    }
+    if (ch === quote) {
+      return { value: out, end: i };
+    }
+    out += ch;
+    i += 1;
+  }
+  return { value: out, end: text.length - 1 };
+}
+
+function extractFieldFromJsonLike(text, field) {
+  const raw = stripCodeFence(text);
+  if (!raw) return '';
+  const matcher = new RegExp(`["']?${field}["']?\\s*:\\s*`, 'i');
+  const match = matcher.exec(raw);
+  if (!match) return '';
+  let i = match.index + match[0].length;
+  while (i < raw.length && /\s/.test(raw[i])) i += 1;
+  if (i >= raw.length) return '';
+  const lead = raw[i];
+  if (lead === '"' || lead === '\'') {
+    return parseQuotedString(raw, lead, i + 1).value.trim();
+  }
+  let j = i;
+  while (j < raw.length && ![',', '\n', '\r', '}'].includes(raw[j])) j += 1;
+  return raw.slice(i, j).trim();
+}
+
+function extractMessageContent(value) {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object' && typeof item.text === 'string') return item.text;
+        return '';
+      })
+      .join('')
+      .trim();
+  }
+  return '';
+}
+
+function toTextCandidate(value) {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    const text = extractMessageContent(value);
+    if (text) return text;
+  }
+  if (!value || typeof value !== 'object') return String(value || '');
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function extractCompletionText(parsed) {
+  if (!parsed || typeof parsed !== 'object') return '';
+
+  const choices = Array.isArray(parsed.choices) ? parsed.choices : [];
+  const choiceMessage = choices[0]?.message;
+  const choiceContent = extractMessageContent(choiceMessage?.content);
+  if (choiceContent) return choiceContent;
+  if (typeof choices[0]?.text === 'string') return choices[0].text;
+
+  if (typeof parsed.output_text === 'string') return parsed.output_text;
+
+  const candidateParts = parsed?.candidates?.[0]?.content?.parts;
+  if (Array.isArray(candidateParts)) {
+    const geminiText = candidateParts.map((part) => String(part?.text || '')).join('').trim();
+    if (geminiText) return geminiText;
+  }
+
+  return '';
+}
+
+function normalizeAgentReply(inputReply, inputSuggestion = '') {
+  let replyCandidate = toTextCandidate(inputReply);
+  let suggestionCandidate = toTextCandidate(inputSuggestion);
+
+  for (let depth = 0; depth < 4; depth += 1) {
+    const parsed = tryParseReplyPayload(replyCandidate);
+    if (!parsed) {
+      const fallbackReply = extractFieldFromJsonLike(replyCandidate, 'reply') || extractFieldFromJsonLike(replyCandidate, 'message');
+      const fallbackSuggestion = extractFieldFromJsonLike(replyCandidate, 'suggestion');
+      if (fallbackReply) replyCandidate = fallbackReply;
+      if (fallbackSuggestion) suggestionCandidate = fallbackSuggestion;
+      break;
+    }
+
+    const completionText = extractCompletionText(parsed);
+    if (completionText && completionText !== replyCandidate) {
+      replyCandidate = completionText;
+      continue;
+    }
+
+    const nestedReply = typeof parsed.reply === 'string'
+      ? parsed.reply
+      : (typeof parsed.message === 'string' ? parsed.message : '');
+    const nestedSuggestion = typeof parsed.suggestion === 'string' ? parsed.suggestion : '';
+    if (nestedReply) replyCandidate = nestedReply;
+    if (nestedSuggestion) suggestionCandidate = nestedSuggestion;
+    if (!nestedReply) break;
+  }
+
+  if (!suggestionCandidate) {
+    suggestionCandidate = extractFieldFromJsonLike(replyCandidate, 'suggestion') || '';
+  }
+
+  return {
+    reply: String(replyCandidate || inputReply || ''),
+    suggestion: String(suggestionCandidate || inputSuggestion || '')
+  };
+}
+
 export function registerAgentRoutes(fastify) {
   fastify.post('/api/agent/run', async (req) => {
     const lang = getLang(req);
@@ -54,7 +230,9 @@ export function registerAgentRoutes(fastify) {
     }
 
     if (mode === 'tools') {
-      return runToolAgent({ projectId, activePath, task, prompt, selection, compileLog, llmConfig, lang });
+      const toolResult = await runToolAgent({ projectId, activePath, task, prompt, selection, compileLog, llmConfig, lang });
+      const normalized = normalizeAgentReply(toolResult?.reply || '', toolResult?.suggestion || '');
+      return { ...toolResult, reply: normalized.reply, suggestion: normalized.suggestion };
     }
 
     const system =
@@ -97,16 +275,8 @@ export function registerAgentRoutes(fastify) {
       };
     }
 
-    let reply = '';
-    let suggestion = '';
-    try {
-      const parsed = JSON.parse(result.content);
-      reply = parsed.reply || '';
-      suggestion = parsed.suggestion || '';
-    } catch {
-      reply = result.content;
-    }
+    const normalized = normalizeAgentReply(result.content, '');
 
-    return { ok: true, reply, suggestion };
+    return { ok: true, reply: normalized.reply, suggestion: normalized.suggestion };
   });
 }
