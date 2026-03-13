@@ -1,6 +1,7 @@
 import { callOpenAICompatible } from '../services/llmService.js';
 import { runToolAgent } from '../services/agentService.js';
 import { getLang, t } from '../i18n/index.js';
+import { authorizeProjectAccess } from '../utils/authUtils.js';
 
 function stripCodeFence(text) {
   const raw = String(text || '').trim();
@@ -179,7 +180,7 @@ function normalizeAgentReply(inputReply, inputSuggestion = '') {
 }
 
 export function registerAgentRoutes(fastify) {
-  fastify.post('/api/agent/run', async (req) => {
+  fastify.post('/api/agent/run', async (req, reply) => {
     const lang = getLang(req);
     const {
       task = 'polish',
@@ -194,6 +195,17 @@ export function registerAgentRoutes(fastify) {
       interaction = 'agent',
       history = []
     } = req.body || {};
+
+    const scopedAuth = req.collabAuth || null;
+    if (scopedAuth && !projectId) {
+      return reply.code(403).send({ ok: false, error: 'Forbidden' });
+    }
+    if (projectId) {
+      const authz = authorizeProjectAccess(req, projectId);
+      if (!authz.ok) {
+        return reply.code(authz.statusCode).send({ ok: false, error: authz.error });
+      }
+    }
 
     if (interaction === 'chat') {
       const safeHistory = Array.isArray(history)

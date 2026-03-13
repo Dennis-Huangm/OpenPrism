@@ -19,6 +19,9 @@ function sign(data) {
 }
 
 export function issueToken({ projectId, role = 'admin', ttlSeconds = COLLAB_TOKEN_TTL }) {
+  if (!COLLAB_TOKEN_SECRET) {
+    throw new Error('Missing collaboration token secret');
+  }
   const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
   const payload = { v: TOKEN_VERSION, pid: projectId, role, exp };
   const body = base64UrlEncode(JSON.stringify(payload));
@@ -27,6 +30,7 @@ export function issueToken({ projectId, role = 'admin', ttlSeconds = COLLAB_TOKE
 }
 
 export function verifyToken(token) {
+  if (!COLLAB_TOKEN_SECRET) return null;
   if (!token || typeof token !== 'string') return null;
   const parts = token.split('.');
   if (parts.length !== 3) return null;

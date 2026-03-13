@@ -9,21 +9,25 @@ export default function CollabJoinPage() {
   const [status, setStatus] = useState(t('正在加入协作...'));
 
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const token = params.get('token') || '';
-    if (!token) {
-      setStatus(t('邀请链接缺少 token。'));
+    const rawHash = window.location.hash.startsWith('#') ? window.location.hash.slice(1) : window.location.hash;
+    const params = new URLSearchParams(rawHash);
+    const joinToken = params.get('join') || '';
+    if (!joinToken) {
+      setStatus(t('邀请链接缺少 join token。'));
       return;
+    }
+    if (window.location.hash) {
+      window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
     }
     setCollabServer(window.location.origin);
     setStatus(t('正在验证邀请...'));
-    resolveCollabToken(token)
+    resolveCollabToken(joinToken)
       .then((res) => {
-        if (!res.ok || !res.projectId) {
+        if (!res.ok || !res.projectId || !res.token) {
           setStatus(t('邀请无效或已过期。'));
           return;
         }
-        setCollabToken(token);
+        setCollabToken(res.token, res.projectId);
         setStatus(t('已加入协作，正在打开项目...'));
         navigate(`/editor/${res.projectId}`, { replace: true });
       })

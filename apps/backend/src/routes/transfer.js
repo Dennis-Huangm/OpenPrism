@@ -8,11 +8,38 @@ import { resolveMineruConfig } from '../services/mineruService.js';
 import { readTemplateManifest, listTemplateEntrypoints } from '../services/templateService.js';
 import { DATA_DIR, TEMPLATE_DIR } from '../config/constants.js';
 import { ensureDir, readJson, writeJson, copyDir } from '../utils/fsUtils.js';
+import { requireAuthIfRemote, requireOwnerAuth } from '../utils/authUtils.js';
 
 // In-memory job store: jobId → { graph, state, status, progressLog }
 const jobs = new Map();
 
 export function registerTransferRoutes(fastify) {
+  const requireTransferAccess = async (request, reply) => {
+    const ownerAuth = requireOwnerAuth(request);
+    if (ownerAuth.ok) {
+      request.transferAuth = null;
+      return;
+    }
+    const auth = requireAuthIfRemote(request);
+    if (!auth.ok) {
+      return reply.code(401).send({ error: 'Unauthorized' });
+    }
+    request.transferAuth = auth.payload || null;
+  };
+
+  const requireJobAccess = (request, reply, job) => {
+    if (!job) {
+      return reply.code(404).send({ error: 'Job not found.' });
+    }
+    const payload = request.transferAuth || null;
+    if (!payload) {
+      return null;
+    }
+    if (job.scopeProjectId !== payload.projectId) {
+      return reply.code(403).send({ error: 'Forbidden' });
+    }
+    return null;
+  };
 
   /**
    * POST /api/transfer/start
@@ -21,7 +48,7 @@ export function registerTransferRoutes(fastify) {
    * Creates a new project from the target template, then starts the transfer.
    * Returns: { jobId, newProjectId }
    */
-  fastify.post('/api/transfer/start', async (request, reply) => {
+  fastify.post('/api/transfer/start', { preHandler: requireTransferAccess }, async (request, reply) => {
     const {
       sourceProjectId, sourceMainFile,
       targetTemplateId, targetMainFile,
@@ -32,6 +59,10 @@ export function registerTransferRoutes(fastify) {
 
     if (!sourceProjectId || !sourceMainFile || !targetTemplateId || !targetMainFile) {
       return reply.code(400).send({ error: 'Missing required fields.' });
+    }
+    const payload = request.transferAuth || null;
+    if (payload) {
+      return reply.code(403).send({ error: 'Forbidden' });
     }
 
     // Validate template exists
@@ -93,6 +124,7 @@ export function registerTransferRoutes(fastify) {
       progressLog: [],
       hasStarted: false,
       iterator: null,
+      scopeProjectId: sourceProjectId,
     });
 
     return { jobId, newProjectId };
@@ -104,11 +136,12 @@ export function registerTransferRoutes(fastify) {
    * Runs the graph one step forward.
    * Returns: { status, currentNode, progressLog }
    */
-  fastify.post('/api/transfer/step', async (request, reply) => {
+  fastify.post('/api/transfer/step', { preHandler: requireTransferAccess }, async (request, reply) => {
     const { jobId } = request.body || {};
     const job = jobs.get(jobId);
-    if (!job) {
-      return reply.code(404).send({ error: 'Job not found.' });
+    const authReply = requireJobAccess(request, reply, job);
+    if (authReply) {
+      return authReply;
     }
 
     // If waiting for images, don't proceed
@@ -147,11 +180,12 @@ export function registerTransferRoutes(fastify) {
    * Body: { jobId, images: [{ page, base64, mime }] }
    * Frontend submits PDF page screenshots for VLM layout check.
    */
-  fastify.post('/api/transfer/submit-images', async (request, reply) => {
+  fastify.post('/api/transfer/submit-images', { preHandler: requireTransferAccess }, async (request, reply) => {
     const { jobId, images } = request.body || {};
     const job = jobs.get(jobId);
-    if (!job) {
-      return reply.code(404).send({ error: 'Job not found.' });
+    const authReply = requireJobAccess(request, reply, job);
+    if (authReply) {
+      return authReply;
     }
 
     if (job.status !== 'waiting_images') {
@@ -180,10 +214,11 @@ export function registerTransferRoutes(fastify) {
    * GET /api/transfer/status/:jobId
    * Returns current job status and progress log.
    */
-  fastify.get('/api/transfer/status/:jobId', async (request, reply) => {
+  fastify.get('/api/transfer/status/:jobId', { preHandler: requireTransferAccess }, async (request, reply) => {
     const job = jobs.get(request.params.jobId);
-    if (!job) {
-      return reply.code(404).send({ error: 'Job not found.' });
+    const authReply = requireJobAccess(request, reply, job);
+    if (authReply) {
+      return authReply;
     }
 
     return {
@@ -202,7 +237,7 @@ export function registerTransferRoutes(fastify) {
    * If not, expects PDF to be uploaded via /api/transfer/upload-pdf.
    * Returns: { jobId, newProjectId }
    */
-  fastify.post('/api/transfer/start-mineru', async (request, reply) => {
+  fastify.post('/api/transfer/start-mineru', { preHandler: requireTransferAccess }, async (request, reply) => {
     const {
       sourceProjectId, sourceMainFile,
       targetTemplateId, targetMainFile,
@@ -219,6 +254,10 @@ export function registerTransferRoutes(fastify) {
       return reply.code(400).send({
         error: 'sourceProjectId and sourceMainFile must be provided together, or both omitted.',
       });
+    }
+    const payload = request.transferAuth || null;
+    if (payload) {
+      return reply.code(403).send({ error: 'Forbidden' });
     }
 
     // Validate template
@@ -282,6 +321,7 @@ export function registerTransferRoutes(fastify) {
       progressLog: [],
       hasStarted: false,
       iterator: null,
+      scopeProjectId: sourceProjectId || '',
     });
 
     return { jobId, newProjectId };
@@ -292,7 +332,7 @@ export function registerTransferRoutes(fastify) {
    * Multipart: { jobId, pdf: File }
    * Upload a PDF for MinerU-based transfer (when no source project).
    */
-  fastify.post('/api/transfer/upload-pdf', async (request, reply) => {
+  fastify.post('/api/transfer/upload-pdf', { preHandler: requireTransferAccess }, async (request, reply) => {
     const parts = request.parts();
     let jobId = '';
     let pdfBuffer = null;
@@ -314,8 +354,9 @@ export function registerTransferRoutes(fastify) {
     }
 
     const job = jobs.get(jobId);
-    if (!job) {
-      return reply.code(404).send({ error: 'Job not found.' });
+    const authReply = requireJobAccess(request, reply, job);
+    if (authReply) {
+      return authReply;
     }
     if (job.state?.transferMode !== 'mineru') {
       return reply.code(400).send({ error: 'Job is not a MinerU transfer job.' });

@@ -31,6 +31,7 @@ export class CollabProvider {
   private ws: WebSocket | null = null;
   private shouldReconnect = false;
   private reconnectAttempts = 0;
+  private reconnectTimer: number | null = null;
   private onStatus?: (status: CollabStatus) => void;
   private onError?: (error: string) => void;
   private docUpdateHandler: ((update: Uint8Array, origin: unknown) => void) | null = null;
@@ -57,6 +58,7 @@ export class CollabProvider {
 
   disconnect() {
     this.shouldReconnect = false;
+    this.clearReconnectTimer();
     this.detachDocListeners();
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.close();
@@ -108,7 +110,18 @@ export class CollabProvider {
     }
   }
 
+  private clearReconnectTimer() {
+    if (this.reconnectTimer != null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+
   private openWebSocket() {
+    this.clearReconnectTimer();
+    if (!this.shouldReconnect) {
+      return;
+    }
     if (!this.serverUrl) {
       this.onError?.('Missing server url');
       return;
@@ -118,12 +131,11 @@ export class CollabProvider {
       projectId: this.projectId,
       file: this.filePath
     });
-    if (this.token) {
-      qs.set('token', this.token);
-    }
     const wsUrl = `${wsBase}/api/collab?${qs.toString()}`;
     this.onStatus?.('connecting');
-    const ws = new WebSocket(wsUrl);
+    const ws = this.token
+      ? new WebSocket(wsUrl, [`openprism-collab.${this.token}`])
+      : new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
     ws.onopen = () => {
       this.reconnectAttempts = 0;
@@ -149,11 +161,18 @@ export class CollabProvider {
       this.onError?.('WebSocket error');
     };
     ws.onclose = () => {
+      if (this.ws === ws) {
+        this.ws = null;
+      }
       this.onStatus?.('disconnected');
       if (this.shouldReconnect) {
         const retryDelay = Math.min(10_000, 800 * Math.pow(2, this.reconnectAttempts));
         this.reconnectAttempts += 1;
-        window.setTimeout(() => this.openWebSocket(), retryDelay);
+        this.clearReconnectTimer();
+        this.reconnectTimer = window.setTimeout(() => {
+          this.reconnectTimer = null;
+          this.openWebSocket();
+        }, retryDelay);
       }
     };
     this.ws = ws;

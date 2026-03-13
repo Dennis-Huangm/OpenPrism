@@ -1,20 +1,105 @@
 import path from 'path';
+import { Transform } from 'stream';
 import { promises as fs, createWriteStream } from 'fs';
 import { pipeline } from 'stream/promises';
 import tar from 'tar';
 import unzipper from 'unzipper';
 import crypto from 'crypto';
-import { DATA_DIR, TEMPLATE_DIR } from '../config/constants.js';
+import { DATA_DIR, MAX_IMPORT_ARCHIVE_BYTES, MAX_IMPORT_ARCHIVE_ENTRY_BYTES, MAX_IMPORT_ARCHIVE_FILES, TEMPLATE_DIR } from '../config/constants.js';
 import { ensureDir, readJson, writeJson, copyDir, listFilesRecursive } from '../utils/fsUtils.js';
-import { safeJoin, sanitizeUploadPath } from '../utils/pathUtils.js';
+import { normalizeProjectPath, safeJoin, sanitizeUploadPath } from '../utils/pathUtils.js';
 import { isTextFile, extractDocumentBody, mergeTemplateBody } from '../utils/texUtils.js';
 import { readTemplateManifest, copyTemplateIntoProject } from '../services/templateService.js';
 import { getProjectRoot } from '../services/projectService.js';
 import { downloadArxivSource, extractArxivId } from '../services/arxivService.js';
+import { beginPathMutation, endPathMutation, flushDocsForPath, hasDocsForPath, removeDocsForPath, renameDocsForPath, evictDocsForProject, markProjectRemoving, restoreProjectDocs, writeDocContent } from '../services/collab/docStore.js';
 import { getLang, t } from '../i18n/index.js';
+import { authorizeProjectAccess, isLocalBootstrapAllowed, requireAuthIfRemote, requireOwnerAuth } from '../utils/authUtils.js';
 
 export function registerProjectRoutes(fastify) {
-  fastify.get('/api/projects', async () => {
+  const createArchiveLimitStream = (state) => new Transform({
+    transform(chunk, _encoding, callback) {
+      const size = Buffer.isBuffer(chunk) ? chunk.byteLength : Buffer.byteLength(chunk);
+      state.entryBytes += size;
+      state.totalBytes += size;
+      if (state.entryBytes > MAX_IMPORT_ARCHIVE_ENTRY_BYTES) {
+        callback(new Error('Archive entry exceeds size limit'));
+        return;
+      }
+      if (state.totalBytes > MAX_IMPORT_ARCHIVE_BYTES) {
+        callback(new Error('Archive exceeds size limit'));
+        return;
+      }
+      callback(null, chunk);
+    }
+  });
+
+  const requireOwnerAccess = async (req, reply) => {
+    if (isLocalBootstrapAllowed(req)) {
+      return;
+    }
+    const auth = requireOwnerAuth(req);
+    if (!auth.ok) {
+      reply.code(401).send({ ok: false, error: 'Unauthorized' });
+    }
+  };
+
+  const requireProjectAccess = async (req, reply) => {
+    if (isLocalBootstrapAllowed(req)) {
+      return;
+    }
+    const authz = authorizeProjectAccess(req, req.params?.id);
+    if (!authz.ok) {
+      reply.code(authz.statusCode).send({ ok: false, error: authz.error });
+    }
+  };
+
+  const requireOwnerProjectAccess = async (req, reply) => {
+    const ownerAuth = requireOwnerAuth(req);
+    if (!ownerAuth.ok) {
+      reply.code(401).send({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    const authz = authorizeProjectAccess(req, req.params?.id, ownerAuth);
+    if (!authz.ok) {
+      reply.code(authz.statusCode).send({ ok: false, error: authz.error });
+    }
+  };
+
+  const isReservedProjectPath = (filePath) => normalizeProjectPath(filePath) === 'project.json';
+
+  const requireOwnerReservedPathAccess = async (req, reply, targetPath) => {
+    if (!isReservedProjectPath(targetPath)) {
+      return false;
+    }
+    const ownerAuth = requireOwnerAuth(req);
+    if (!ownerAuth.ok) {
+      reply.code(403).send({ ok: false, error: 'Forbidden' });
+      return true;
+    }
+    return false;
+  };
+
+  const requireProjectMintingAccess = async (req, reply) => {
+    if (isLocalBootstrapAllowed(req)) {
+      return;
+    }
+    const ownerAuth = requireOwnerAuth(req);
+    if (ownerAuth.ok) {
+      return;
+    }
+    const auth = requireAuthIfRemote(req);
+    if (!auth.ok) {
+      reply.code(401).send({ ok: false, error: 'Unauthorized' });
+      return;
+    }
+    if (auth.payload) {
+      reply.code(403).send({ ok: false, error: 'Forbidden' });
+      return;
+    }
+    reply.code(401).send({ ok: false, error: 'Unauthorized' });
+  };
+  fastify.get('/api/projects', { preHandler: requireOwnerAccess }, async () => {
     await ensureDir(DATA_DIR);
     const entries = await fs.readdir(DATA_DIR, { withFileTypes: true });
     const projects = [];
@@ -38,7 +123,7 @@ export function registerProjectRoutes(fastify) {
     return { projects };
   });
 
-  fastify.post('/api/projects', async (req, reply) => {
+  fastify.post('/api/projects', { preHandler: requireOwnerAccess }, async (req, reply) => {
     await ensureDir(DATA_DIR);
     const { name = 'Untitled', template } = req.body || {};
     const id = crypto.randomUUID();
@@ -57,7 +142,7 @@ export function registerProjectRoutes(fastify) {
     reply.send(meta);
   });
 
-  fastify.post('/api/projects/import-zip', async (req) => {
+  fastify.post('/api/projects/import-zip', { preHandler: requireOwnerAccess }, async (req) => {
     const lang = getLang(req);
     await ensureDir(DATA_DIR);
     const id = crypto.randomUUID();
@@ -67,6 +152,8 @@ export function registerProjectRoutes(fastify) {
     let hasZip = false;
 
     try {
+      let importedFiles = 0;
+      let importedBytes = 0;
       const parts = req.parts();
       for await (const part of parts) {
         if (part.type === 'field' && part.fieldname === 'projectName') {
@@ -77,10 +164,18 @@ export function registerProjectRoutes(fastify) {
         hasZip = true;
         const zipStream = part.file.pipe(unzipper.Parse({ forceStream: true }));
         for await (const entry of zipStream) {
+          if (entry.type === 'SymbolicLink' || entry.type === 'FileLink') {
+            entry.autodrain();
+            continue;
+          }
           const relPath = sanitizeUploadPath(entry.path);
           if (!relPath || relPath.endsWith('project.json')) {
             entry.autodrain();
             continue;
+          }
+          importedFiles += 1;
+          if (importedFiles > MAX_IMPORT_ARCHIVE_FILES) {
+            throw new Error('Archive contains too many files');
           }
           const abs = safeJoin(projectRoot, relPath);
           if (entry.type === 'Directory') {
@@ -89,7 +184,9 @@ export function registerProjectRoutes(fastify) {
             continue;
           }
           await ensureDir(path.dirname(abs));
-          await pipeline(entry, createWriteStream(abs));
+          const archiveState = { entryBytes: 0, totalBytes: importedBytes };
+          await pipeline(entry, createArchiveLimitStream(archiveState), createWriteStream(abs));
+          importedBytes = archiveState.totalBytes;
         }
       }
     } catch (err) {
@@ -106,7 +203,7 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, project: meta };
   });
 
-  fastify.get('/api/projects/import-arxiv-sse', async (req, reply) => {
+  fastify.get('/api/projects/import-arxiv-sse', { preHandler: requireOwnerAccess }, async (req, reply) => {
     const lang = getLang(req);
     await ensureDir(DATA_DIR);
     const { arxivIdOrUrl, projectName } = req.query;
@@ -139,8 +236,13 @@ export function registerProjectRoutes(fastify) {
 
     const tmpTar = path.join(projectRoot, '__arxiv_source.tar.gz');
     try {
+      let extractedFiles = 0;
+      let extractedBytes = 0;
       send('progress', { phase: 'download', percent: 0 });
       await downloadArxivSource(arxivId, tmpTar, ({ received, total }) => {
+        if (received > MAX_IMPORT_ARCHIVE_BYTES) {
+          throw new Error('Archive download exceeds size limit');
+        }
         const percent = total > 0 ? Math.round((received / total) * 100) : -1;
         send('progress', { phase: 'download', percent, received, total });
       });
@@ -149,10 +251,25 @@ export function registerProjectRoutes(fastify) {
       await tar.x({
         file: tmpTar,
         cwd: projectRoot,
-        filter: (entryPath) => {
+        filter: (entryPath, entry) => {
           if (!entryPath) return false;
           if (path.isAbsolute(entryPath)) return false;
-          return !entryPath.split('/').some((part) => part === '..');
+          if (entry?.type !== 'File' && entry?.type !== 'Directory') return false;
+          extractedFiles += 1;
+          if (extractedFiles > MAX_IMPORT_ARCHIVE_FILES) {
+            throw new Error('Archive contains too many files');
+          }
+          if (entry?.type === 'File') {
+            const entrySize = Number(entry.size || 0);
+            if (entrySize > MAX_IMPORT_ARCHIVE_ENTRY_BYTES) {
+              throw new Error('Archive entry exceeds size limit');
+            }
+            extractedBytes += entrySize;
+            if (extractedBytes > MAX_IMPORT_ARCHIVE_BYTES) {
+              throw new Error('Archive exceeds size limit');
+            }
+          }
+          return !entryPath.split(/[\\/]/).some((part) => part === '..');
         }
       });
     } catch (err) {
@@ -170,7 +287,7 @@ export function registerProjectRoutes(fastify) {
     return reply;
   });
 
-  fastify.post('/api/projects/:id/rename-project', async (req) => {
+  fastify.post('/api/projects/:id/rename-project', { preHandler: requireOwnerProjectAccess }, async (req) => {
     const { id } = req.params;
     const { name } = req.body || {};
     if (!name) return { ok: false, error: 'Missing name' };
@@ -182,7 +299,7 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, project: next };
   });
 
-  fastify.post('/api/projects/:id/copy', async (req) => {
+  fastify.post('/api/projects/:id/copy', { preHandler: requireProjectMintingAccess }, async (req) => {
     const { id } = req.params;
     const { name } = req.body || {};
     const srcRoot = await getProjectRoot(id);
@@ -203,7 +320,7 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, project: newMeta };
   });
 
-  fastify.delete('/api/projects/:id', async (req) => {
+  fastify.delete('/api/projects/:id', { preHandler: requireOwnerProjectAccess }, async (req) => {
     const { id } = req.params;
     const projectRoot = await getProjectRoot(id);
     const metaPath = path.join(projectRoot, 'project.json');
@@ -213,14 +330,21 @@ export function registerProjectRoutes(fastify) {
     return { ok: true };
   });
 
-  fastify.delete('/api/projects/:id/permanent', async (req) => {
+  fastify.delete('/api/projects/:id/permanent', { preHandler: requireOwnerProjectAccess }, async (req) => {
     const { id } = req.params;
     const projectRoot = await getProjectRoot(id);
-    await fs.rm(projectRoot, { recursive: true, force: true });
-    return { ok: true };
+    markProjectRemoving(id);
+    try {
+      await fs.rm(projectRoot, { recursive: true, force: true });
+      await evictDocsForProject(id);
+      return { ok: true };
+    } catch (err) {
+      restoreProjectDocs(id);
+      throw err;
+    }
   });
 
-  fastify.patch('/api/projects/:id/tags', async (req) => {
+  fastify.patch('/api/projects/:id/tags', { preHandler: requireOwnerProjectAccess }, async (req) => {
     const { id } = req.params;
     const { tags } = req.body || {};
     if (!Array.isArray(tags)) return { ok: false, error: 'tags must be an array' };
@@ -232,7 +356,7 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, project: next };
   });
 
-  fastify.patch('/api/projects/:id/archive', async (req) => {
+  fastify.patch('/api/projects/:id/archive', { preHandler: requireOwnerProjectAccess }, async (req) => {
     const { id } = req.params;
     const { archived } = req.body || {};
     const projectRoot = await getProjectRoot(id);
@@ -243,7 +367,7 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, project: next };
   });
 
-  fastify.patch('/api/projects/:id/trash', async (req) => {
+  fastify.patch('/api/projects/:id/trash', { preHandler: requireOwnerProjectAccess }, async (req) => {
     const { id } = req.params;
     const { trashed } = req.body || {};
     const projectRoot = await getProjectRoot(id);
@@ -259,7 +383,7 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, project: next };
   });
 
-  fastify.get('/api/projects/:id/tree', async (req) => {
+  fastify.get('/api/projects/:id/tree', { preHandler: requireProjectAccess }, async (req) => {
     const { id } = req.params;
     const projectRoot = await getProjectRoot(id);
     const items = await listFilesRecursive(projectRoot);
@@ -281,7 +405,7 @@ export function registerProjectRoutes(fastify) {
     return { items, fileOrder, mainFile };
   });
 
-  fastify.post('/api/projects/:id/file-order', async (req) => {
+  fastify.post('/api/projects/:id/file-order', { preHandler: requireOwnerProjectAccess }, async (req) => {
     const { id } = req.params;
     const { folder = '', order } = req.body || {};
     if (!Array.isArray(order)) {
@@ -295,7 +419,7 @@ export function registerProjectRoutes(fastify) {
     return { ok: true };
   });
 
-  fastify.post('/api/projects/:id/main-file', async (req) => {
+  fastify.post('/api/projects/:id/main-file', { preHandler: requireOwnerProjectAccess }, async (req) => {
     const { id } = req.params;
     const rawMainFile = req.body?.mainFile;
     if (typeof rawMainFile !== 'string') {
@@ -328,7 +452,7 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, mainFile: next.mainFile };
   });
 
-  fastify.get('/api/projects/:id/file', async (req) => {
+  fastify.get('/api/projects/:id/file', { preHandler: requireProjectAccess }, async (req) => {
     const { id } = req.params;
     const { path: filePath } = req.query;
     if (!filePath) return { content: '' };
@@ -338,7 +462,7 @@ export function registerProjectRoutes(fastify) {
     return { content };
   });
 
-  fastify.get('/api/projects/:id/blob', async (req, reply) => {
+  fastify.get('/api/projects/:id/blob', { preHandler: requireProjectAccess }, async (req, reply) => {
     const { id } = req.params;
     const { path: filePath } = req.query;
     if (!filePath) return reply.code(400).send('Missing path');
@@ -350,16 +474,20 @@ export function registerProjectRoutes(fastify) {
       '.png': 'image/png',
       '.jpg': 'image/jpeg',
       '.jpeg': 'image/jpeg',
-      '.svg': 'image/svg+xml',
+      '.svg': 'application/octet-stream',
       '.pdf': 'application/pdf',
       '.eps': 'application/postscript'
     };
     const contentType = contentTypes[ext] || 'application/octet-stream';
     reply.header('Content-Type', contentType);
+    if (ext === '.svg') {
+      reply.header('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
+      reply.header('X-Content-Type-Options', 'nosniff');
+    }
     return reply.send(buffer);
   });
 
-  fastify.post('/api/projects/:id/upload', async (req) => {
+  fastify.post('/api/projects/:id/upload', { preHandler: requireProjectAccess }, async (req, reply) => {
     const { id } = req.params;
     const projectRoot = await getProjectRoot(id);
     const saved = [];
@@ -368,6 +496,9 @@ export function registerProjectRoutes(fastify) {
       if (part.type !== 'file') continue;
       const relPath = sanitizeUploadPath(part.filename);
       if (!relPath) continue;
+      if (await requireOwnerReservedPathAccess(req, reply, relPath)) {
+        return reply;
+      }
       const abs = safeJoin(projectRoot, relPath);
       await ensureDir(path.dirname(abs));
       await pipeline(part.file, createWriteStream(abs));
@@ -376,24 +507,49 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, files: saved };
   });
 
-  fastify.put('/api/projects/:id/file', async (req) => {
+  fastify.put('/api/projects/:id/file', { preHandler: requireProjectAccess }, async (req, reply) => {
     const { id } = req.params;
     const { path: filePath, content } = req.body || {};
-    if (!filePath) return { ok: false };
+    const normalizedPath = normalizeProjectPath(filePath);
+    if (!normalizedPath) return { ok: false, error: 'Missing file path' };
+    if (await requireOwnerReservedPathAccess(req, reply, normalizedPath)) {
+      return reply;
+    }
     const projectRoot = await getProjectRoot(id);
-    const abs = safeJoin(projectRoot, filePath);
+    const abs = safeJoin(projectRoot, normalizedPath);
+    const metaPath = path.join(projectRoot, 'project.json');
+    const nextContent = content ?? '';
+    if (isTextFile(normalizedPath)) {
+      try {
+        const synced = await writeDocContent({
+          key: `${id}:${normalizedPath}`,
+          absPath: abs,
+          metaPath,
+          content: nextContent
+        });
+        if (synced) {
+          return { ok: true };
+        }
+      } catch (err) {
+        if (err?.code === 'PROJECT_REMOVED') {
+          return { ok: false, error: 'Project removed' };
+        }
+        if (err?.code === 'PATH_MUTATING') {
+          return { ok: false, error: 'Path is mutating' };
+        }
+        throw err;
+      }
+    }
     await ensureDir(path.dirname(abs));
-    await fs.writeFile(abs, content ?? '', 'utf8');
+    await fs.writeFile(abs, nextContent, 'utf8');
     try {
-      const metaPath = path.join(projectRoot, 'project.json');
       const meta = await readJson(metaPath);
-      meta.updatedAt = new Date().toISOString();
-      await writeJson(metaPath, meta);
+      await writeJson(metaPath, { ...meta, updatedAt: new Date().toISOString() });
     } catch { /* ignore */ }
     return { ok: true };
   });
 
-  fastify.get('/api/projects/:id/files', async (req) => {
+  fastify.get('/api/projects/:id/files', { preHandler: requireProjectAccess }, async (req) => {
     const { id } = req.params;
     const projectRoot = await getProjectRoot(id);
     const items = await listFilesRecursive(projectRoot);
@@ -411,7 +567,7 @@ export function registerProjectRoutes(fastify) {
     return { files };
   });
 
-  fastify.post('/api/projects/:id/convert-template', async (req) => {
+  fastify.post('/api/projects/:id/convert-template', { preHandler: requireOwnerProjectAccess }, async (req) => {
     const { id } = req.params;
     const { targetTemplate, mainFile } = req.body || {};
     if (!targetTemplate) return { ok: false, error: 'Missing targetTemplate' };
@@ -449,7 +605,7 @@ export function registerProjectRoutes(fastify) {
     }
   });
 
-  fastify.post('/api/projects/:id/template', async (req) => {
+  fastify.post('/api/projects/:id/template', { preHandler: requireOwnerProjectAccess }, async (req) => {
     const { id } = req.params;
     const { template } = req.body || {};
     const projectRoot = await getProjectRoot(id);
@@ -465,7 +621,7 @@ export function registerProjectRoutes(fastify) {
     return { ok: true, mainFile: templateMeta.mainFile };
   });
 
-  fastify.post('/api/projects/:id/folder', async (req) => {
+  fastify.post('/api/projects/:id/folder', { preHandler: requireProjectAccess }, async (req) => {
     const { id } = req.params;
     const { path: folderPath } = req.body || {};
     if (!folderPath) return { ok: false };
@@ -475,38 +631,74 @@ export function registerProjectRoutes(fastify) {
     return { ok: true };
   });
 
-  fastify.post('/api/projects/:id/rename', async (req) => {
+  fastify.post('/api/projects/:id/rename', { preHandler: requireProjectAccess }, async (req, reply) => {
     const { id } = req.params;
     const { from, to } = req.body || {};
-    if (!from || !to) return { ok: false };
+    const normalizedFrom = normalizeProjectPath(from);
+    const normalizedTo = normalizeProjectPath(to);
+    if (!normalizedFrom || !normalizedTo || normalizedFrom === normalizedTo) return { ok: false };
+    if (await requireOwnerReservedPathAccess(req, reply, normalizedFrom) || await requireOwnerReservedPathAccess(req, reply, normalizedTo)) {
+      return reply;
+    }
     const projectRoot = await getProjectRoot(id);
-    const absFrom = safeJoin(projectRoot, from);
-    const absTo = safeJoin(projectRoot, to);
-    await ensureDir(path.dirname(absTo));
-    await fs.rename(absFrom, absTo);
-    return { ok: true };
+    beginPathMutation(id, normalizedFrom);
+    beginPathMutation(id, normalizedTo);
+    try {
+      await flushDocsForPath(id, normalizedFrom, { allowMutating: true });
+      if (hasDocsForPath(id, normalizedTo)) {
+        return { ok: false, error: 'Target path is busy' };
+      }
+      const absFrom = safeJoin(projectRoot, normalizedFrom);
+      const absTo = safeJoin(projectRoot, normalizedTo);
+      try {
+        await fs.stat(absTo);
+        return { ok: false, error: 'Target path already exists' };
+      } catch (err) {
+        if (err?.code !== 'ENOENT') {
+          throw err;
+        }
+      }
+      await ensureDir(path.dirname(absTo));
+      await fs.rename(absFrom, absTo);
+      await renameDocsForPath(id, normalizedFrom, normalizedTo, projectRoot);
+      return { ok: true };
+    } finally {
+      endPathMutation(id, normalizedTo);
+      endPathMutation(id, normalizedFrom);
+    }
   });
 
-  fastify.delete('/api/projects/:id/file', async (req) => {
+  fastify.delete('/api/projects/:id/file', { preHandler: requireProjectAccess }, async (req, reply) => {
     const { id } = req.params;
     const { path: filePath } = req.query || {};
-    if (!filePath) return { ok: false, error: 'Missing file path' };
-    const projectRoot = await getProjectRoot(id);
-    const abs = safeJoin(projectRoot, filePath);
-    // Check if it's a directory
-    try {
-      const stat = await fs.stat(abs);
-      if (stat.isDirectory()) {
-        await fs.rm(abs, { recursive: true, force: true });
-      } else {
-        await fs.rm(abs, { force: true });
-      }
-    } catch (err) {
-      if (err.code === 'ENOENT') {
-        return { ok: false, error: 'File not found' };
-      }
-      throw err;
+    const normalizedPath = normalizeProjectPath(filePath);
+    if (!normalizedPath) return { ok: false, error: 'Missing file path' };
+    if (await requireOwnerReservedPathAccess(req, reply, normalizedPath)) {
+      return reply;
     }
-    return { ok: true };
+    const projectRoot = await getProjectRoot(id);
+    beginPathMutation(id, normalizedPath);
+    try {
+      await flushDocsForPath(id, normalizedPath, { allowMutating: true });
+      const abs = safeJoin(projectRoot, normalizedPath);
+      // Check if it's a directory
+      try {
+        const stat = await fs.stat(abs);
+        if (stat.isDirectory()) {
+          await fs.rm(abs, { recursive: true, force: true });
+        } else {
+          await fs.rm(abs, { force: true });
+        }
+      } catch (err) {
+        if (err.code === 'ENOENT') {
+          return { ok: false, error: 'File not found' };
+        }
+        throw err;
+      }
+      await removeDocsForPath(id, normalizedPath);
+      return { ok: true };
+    } finally {
+      endPathMutation(id, normalizedPath);
+    }
   });
 }

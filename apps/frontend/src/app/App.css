@@ -2066,7 +2066,7 @@ body {
   justify-content: space-between;
   gap: 12px;
   padding: 10px 12px;
-  margin: 12px 12px 0;
+  margin: 0px 12px 10px;
   border-radius: 12px;
   border: 1px solid rgba(120, 98, 83, 0.2);
   background: rgba(255, 255, 255, 0.9);
@@ -4100,11 +4100,6 @@ textarea.input {
   display: flex;
   gap: 6px;
   margin-top: 8px;
-  opacity: 0;
-  transition: opacity 0.15s;
-}
-
-.chat-msg:hover .msg-actions {
   opacity: 1;
 }
 

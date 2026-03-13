@@ -15,3 +15,24 @@ export function sanitizeUploadPath(filename) {
   const parts = normalized.split('/').filter((part) => part && part !== '.' && part !== '..');
   return parts.join('/');
 }
+
+export function normalizeProjectPath(value) {
+  if (typeof value !== 'string') return '';
+  const normalized = value.replace(/\\/g, '/').trim().replace(/^\/+/, '');
+  if (!normalized || normalized === '.') return '';
+  const parts = [];
+  for (const part of normalized.split('/')) {
+    if (!part || part === '.') {
+      continue;
+    }
+    if (part === '..') {
+      if (parts.length === 0) {
+        return '';
+      }
+      parts.pop();
+      continue;
+    }
+    parts.push(part);
+  }
+  return parts.join('/');
+}

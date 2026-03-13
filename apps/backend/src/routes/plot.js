@@ -4,11 +4,16 @@ import { ensureDir } from '../utils/fsUtils.js';
 import { getProjectRoot } from '../services/projectService.js';
 import { resolveLLMConfig, callOpenAICompatible } from '../services/llmService.js';
 import { runPythonPlot } from '../services/plotService.js';
+import { authorizeProjectAccess } from '../utils/authUtils.js';
 
 export function registerPlotRoutes(fastify) {
-  fastify.post('/api/plot/from-table', async (req) => {
+  fastify.post('/api/plot/from-table', async (req, reply) => {
     const { projectId, tableLatex, chartType, title, prompt, filename, llmConfig, retries } = req.body || {};
     if (!projectId) return { ok: false, error: 'Missing projectId.' };
+    const authz = authorizeProjectAccess(req, projectId);
+    if (!authz.ok) {
+      return reply.code(authz.statusCode).send({ ok: false, error: authz.error });
+    }
     if (!tableLatex) return { ok: false, error: 'Missing tableLatex.' };
     const projectRoot = await getProjectRoot(projectId);
     const safeNameBase = sanitizeUploadPath(filename || `plot_${Date.now()}.png`) || `plot_${Date.now()}.png`;

@@ -4,7 +4,7 @@ import cors from '@fastify/cors';
 import multipart from '@fastify/multipart';
 import websocket from '@fastify/websocket';
 import { ensureDir } from './utils/fsUtils.js';
-import { DATA_DIR, PORT, TUNNEL_MODE } from './config/constants.js';
+import { ALLOW_LOCAL_AUTH_BYPASS, COLLAB_REQUIRE_TOKEN, COLLAB_TOKEN_SECRET, DATA_DIR, OWNER_TOKEN_SECRET, PORT, TUNNEL_MODE } from './config/constants.js';
 import { registerHealthRoutes } from './routes/health.js';
 import { registerArxivRoutes } from './routes/arxiv.js';
 import { registerProjectRoutes } from './routes/projects.js';
@@ -16,7 +16,7 @@ import { registerAgentRoutes } from './routes/agent.js';
 import { registerCollabRoutes } from './routes/collab.js';
 import { registerTransferRoutes } from './routes/transfer.js';
 import { tryStartTunnel } from './services/tunnel.js';
-import { requireAuthIfRemote } from './utils/authUtils.js';
+import { isLocalBootstrapAllowed, requireAuthIfRemote } from './utils/authUtils.js';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
@@ -32,11 +32,20 @@ await fastify.register(multipart, {
 await fastify.register(websocket);
 fastify.decorateRequest('collabAuth', null);
 
+const bootstrapAllowedAtStartup = ALLOW_LOCAL_AUTH_BYPASS && (TUNNEL_MODE === 'false' || TUNNEL_MODE === '0' || TUNNEL_MODE === 'no');
+if (COLLAB_REQUIRE_TOKEN && !COLLAB_TOKEN_SECRET && !OWNER_TOKEN_SECRET && !bootstrapAllowedAtStartup) {
+  throw new Error('Missing auth secrets: configure OPENPRISM_COLLAB_TOKEN_SECRET or OPENPRISM_OWNER_TOKEN_SECRET');
+}
+
 fastify.addHook('preHandler', async (req, reply) => {
   if (!req.url.startsWith('/api')) return;
   if (req.method === 'OPTIONS') return;
   if (req.url.startsWith('/api/health')) return;
   if (req.url.startsWith('/api/collab')) return;
+  if (isLocalBootstrapAllowed(req)) {
+    req.collabAuth = null;
+    return;
+  }
   const auth = requireAuthIfRemote(req);
   if (!auth.ok) {
     reply.code(401).send({ ok: false, error: 'Unauthorized' });

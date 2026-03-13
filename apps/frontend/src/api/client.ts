@@ -53,7 +53,9 @@ export interface ArxivPaper {
 const API_BASE = '';
 const LANG_KEY = 'openprism-lang';
 const COLLAB_TOKEN_KEY = 'openprism-collab-token';
+const COLLAB_PROJECT_KEY = 'openprism-collab-project';
 const COLLAB_SERVER_KEY = 'openprism-collab-server';
+const OWNER_TOKEN_KEY = 'openprism-owner-token';
 
 function getLangHeader() {
   if (typeof window === 'undefined') return 'zh-CN';
@@ -61,20 +63,49 @@ function getLangHeader() {
   return stored === 'en-US' ? 'en-US' : 'zh-CN';
 }
 
-export function setCollabToken(token: string) {
+export function setCollabToken(token: string, projectId?: string) {
   if (typeof window === 'undefined') return;
   if (!token) return;
   window.sessionStorage.setItem(COLLAB_TOKEN_KEY, token);
+  if (projectId) {
+    window.sessionStorage.setItem(COLLAB_PROJECT_KEY, projectId);
+  }
 }
 
 export function clearCollabToken() {
   if (typeof window === 'undefined') return;
   window.sessionStorage.removeItem(COLLAB_TOKEN_KEY);
+  window.sessionStorage.removeItem(COLLAB_PROJECT_KEY);
+}
+
+export function setOwnerToken(token: string) {
+  if (typeof window === 'undefined') return;
+  if (!token) return;
+  window.sessionStorage.setItem(OWNER_TOKEN_KEY, token);
+}
+
+export function clearOwnerToken() {
+  if (typeof window === 'undefined') return;
+  window.sessionStorage.removeItem(OWNER_TOKEN_KEY);
+}
+
+export function getOwnerToken() {
+  if (typeof window === 'undefined') return '';
+  return window.sessionStorage.getItem(OWNER_TOKEN_KEY) || '';
 }
 
 export function getCollabToken() {
   if (typeof window === 'undefined') return '';
   return window.sessionStorage.getItem(COLLAB_TOKEN_KEY) || '';
+}
+
+export function getCollabProjectId() {
+  if (typeof window === 'undefined') return '';
+  return window.sessionStorage.getItem(COLLAB_PROJECT_KEY) || '';
+}
+
+export function hasCollabToken() {
+  return Boolean(getCollabToken());
 }
 
 export function setCollabServer(server: string) {
@@ -88,10 +119,23 @@ export function getCollabServer() {
   return window.localStorage.getItem(COLLAB_SERVER_KEY) || '';
 }
 
-function getAuthHeader(): Record<string, string> {
-  const token = getCollabToken();
-  if (!token) return {};
-  return { Authorization: `Bearer ${token}` };
+function getAuthHeader(options?: { preferCollab?: boolean; collabToken?: string; projectId?: string }): Record<string, string> {
+  const token = options?.collabToken || getCollabToken();
+  const collabProjectId = getCollabProjectId();
+  const ownerToken = getOwnerToken();
+  if (options?.preferCollab) {
+    if (token && (!options.projectId || options.projectId === collabProjectId)) {
+      return { Authorization: `Bearer ${token}` };
+    }
+    if (ownerToken) {
+      return { Authorization: `Bearer ${ownerToken}` };
+    }
+    return {};
+  }
+  if (ownerToken) {
+    return { Authorization: `Bearer ${ownerToken}` };
+  }
+  return {};
 }
 
 function stripCodeFence(text: string) {
@@ -274,11 +318,11 @@ function normalizeAgentText(rawReply: unknown, rawSuggestion: unknown): { reply:
   return { reply: directReply, suggestion: directSuggestion };
 }
 
-async function request<T>(url: string, options?: RequestInit): Promise<T> {
+async function request<T>(url: string, options?: RequestInit, authOptions?: { preferCollab?: boolean }): Promise<T> {
   const lang = getLangHeader();
   const mergedHeaders: Record<string, string> = {
     'x-lang': lang,
-    ...getAuthHeader(),
+    ...getAuthHeader(authOptions),
     ...(options?.headers as Record<string, string> || {})
   };
   if (options?.body) {
@@ -352,20 +396,24 @@ export function trashProject(id: string, trashed: boolean) {
   });
 }
 
-export function getProjectTree(id: string) {
-  return request<{ items: FileItem[]; fileOrder?: FileOrderMap; mainFile?: string }>(`/api/projects/${id}/tree`);
+export function getProjectTree(id: string, collabToken?: string) {
+  return request<{ items: FileItem[]; fileOrder?: FileOrderMap; mainFile?: string }>(`/api/projects/${id}/tree`, undefined, {
+    preferCollab: true,
+    collabToken,
+    projectId: id
+  });
 }
 
 export function getFile(id: string, filePath: string) {
   const qs = new URLSearchParams({ path: filePath }).toString();
-  return request<{ content: string }>(`/api/projects/${id}/file?${qs}`);
+  return request<{ content: string }>(`/api/projects/${id}/file?${qs}`, undefined, { preferCollab: true, projectId: id });
 }
 
 export function writeFile(id: string, filePath: string, content: string) {
   return request<{ ok: boolean }>(`/api/projects/${id}/file`, {
     method: 'PUT',
     body: JSON.stringify({ path: filePath, content })
-  });
+  }, { preferCollab: true, projectId: id });
 }
 
 export async function setProjectMainFile(id: string, mainFile: string) {
@@ -381,7 +429,9 @@ export async function setProjectMainFile(id: string, mainFile: string) {
 
 export function getAllFiles(id: string) {
   return request<{ files: { path: string; content: string; encoding?: 'utf8' | 'base64' }[] }>(
-    `/api/projects/${id}/files`
+    `/api/projects/${id}/files`,
+    undefined,
+    { preferCollab: true }
   );
 }
 
@@ -389,28 +439,21 @@ export function createFolder(id: string, folderPath: string) {
   return request<{ ok: boolean }>(`/api/projects/${id}/folder`, {
     method: 'POST',
     body: JSON.stringify({ path: folderPath })
-  });
+  }, { preferCollab: true, projectId: id });
 }
 
 export function renamePath(id: string, from: string, to: string) {
   return request<{ ok: boolean }>(`/api/projects/${id}/rename`, {
     method: 'POST',
     body: JSON.stringify({ from, to })
-  });
+  }, { preferCollab: true, projectId: id });
 }
 
-export async function deleteFile(id: string, filePath: string) {
+export function deleteFile(id: string, filePath: string) {
   const qs = new URLSearchParams({ path: filePath }).toString();
-  const res = await fetch(`/api/projects/${id}/file?${qs}`, {
-    method: 'DELETE',
-    headers: {
-      'x-lang': getLangHeader()
-    }
-  });
-  if (!res.ok) {
-    throw new Error(await res.text());
-  }
-  return res.json() as Promise<{ ok: boolean; error?: string }>;
+  return request<{ ok: boolean; error?: string }>(`/api/projects/${id}/file?${qs}`, {
+    method: 'DELETE'
+  }, { preferCollab: true, projectId: id });
 }
 
 export function updateFileOrder(id: string, folder: string, order: string[]) {
@@ -432,7 +475,7 @@ export async function uploadFiles(projectId: string, files: File[], basePath?: s
     body: form,
     headers: {
       'x-lang': getLangHeader(),
-      ...getAuthHeader()
+      ...getAuthHeader({ preferCollab: true, projectId })
     }
   });
   if (!res.ok) {
@@ -442,28 +485,32 @@ export async function uploadFiles(projectId: string, files: File[], basePath?: s
 }
 
 export function createCollabInvite(id: string) {
-  return request<{ ok: boolean; token: string }>(`/api/projects/${id}/collab/invite`, {
+  return request<{ ok: boolean; token: string; joinToken: string }>(`/api/projects/${id}/collab/invite`, {
     method: 'POST',
     body: JSON.stringify({})
-  });
+  }, { preferCollab: false });
 }
 
-export function resolveCollabToken(token: string) {
-  const qs = new URLSearchParams({ token }).toString();
-  return request<{ ok: boolean; projectId: string; projectName: string; role: string }>(`/api/collab/resolve?${qs}`);
+export function resolveCollabToken(joinToken: string) {
+  return request<{ ok: boolean; projectId: string; projectName: string; role: string; token: string }>(`/api/collab/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({ joinToken })
+  });
 }
 
 export function flushCollabFile(id: string, filePath: string) {
   return request<{ ok: boolean }>(`/api/projects/${id}/collab/flush`, {
     method: 'POST',
     body: JSON.stringify({ path: filePath })
-  });
+  }, { preferCollab: true, projectId: id });
 }
 
 export function getCollabStatus(id: string, filePath: string) {
   const qs = new URLSearchParams({ path: filePath }).toString();
   return request<{ ok: boolean; diagnostics: { conns: number; lastError: string | null } | null }>(
-    `/api/projects/${id}/collab/status?${qs}`
+    `/api/projects/${id}/collab/status?${qs}`,
+    undefined,
+    { preferCollab: true, projectId: id }
   );
 }
 
@@ -580,6 +627,16 @@ export function plotFromTable(payload: {
   );
 }
 
+export async function fetchProjectBlob(projectId: string, filePath: string): Promise<Blob> {
+  const res = await fetch(`/api/projects/${projectId}/blob?path=${encodeURIComponent(filePath)}`, {
+    headers: getAuthHeader({ preferCollab: true, projectId })
+  });
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  return res.blob();
+}
+
 export function callLLM(payload: {
   messages: { role: 'system' | 'user' | 'assistant'; content: string }[];
   model?: string;
@@ -611,39 +668,70 @@ export async function importZip(payload: { file: File; projectName?: string }) {
   return res.json() as Promise<{ ok: boolean; project?: ProjectMeta; error?: string }>;
 }
 
-export function importArxivSSE(
+export async function importArxivSSE(
   payload: { arxivIdOrUrl: string; projectName?: string },
   onProgress?: (data: { phase: string; percent: number; received?: number; total?: number }) => void
 ): Promise<{ ok: boolean; project?: ProjectMeta; error?: string }> {
-  return new Promise((resolve, reject) => {
-    const params = new URLSearchParams({ arxivIdOrUrl: payload.arxivIdOrUrl });
-    if (payload.projectName) params.set('projectName', payload.projectName);
-    const token = getCollabToken();
-    if (token) params.set('token', token);
-    const es = new EventSource(`/api/projects/import-arxiv-sse?${params.toString()}`);
-
-    es.addEventListener('progress', (e) => {
-      if (onProgress) {
-        try { onProgress(JSON.parse(e.data)); } catch {}
-      }
-    });
-    es.addEventListener('done', (e) => {
-      es.close();
-      try { resolve(JSON.parse(e.data)); } catch { resolve({ ok: true }); }
-    });
-    es.addEventListener('error', (e) => {
-      es.close();
-      const me = e as MessageEvent;
-      if (me.data) {
-        try {
-          const d = JSON.parse(me.data);
-          resolve({ ok: false, error: d.error || 'Unknown error' });
-          return;
-        } catch {}
-      }
-      reject(new Error('SSE connection failed'));
-    });
+  const params = new URLSearchParams({ arxivIdOrUrl: payload.arxivIdOrUrl });
+  if (payload.projectName) params.set('projectName', payload.projectName);
+  const res = await fetch(`/api/projects/import-arxiv-sse?${params.toString()}`, {
+    headers: {
+      'x-lang': getLangHeader(),
+      ...getAuthHeader()
+    }
   });
+  if (!res.ok) {
+    throw new Error(await res.text());
+  }
+  const reader = res.body?.getReader();
+  if (!reader) {
+    throw new Error('SSE connection failed');
+  }
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalResult: { ok: boolean; project?: ProjectMeta; error?: string } | null = null;
+
+  while (finalResult == null) {
+    const { value, done } = await reader.read();
+    if (done) {
+      break;
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const events = buffer.split('\n\n');
+    buffer = events.pop() || '';
+    for (const eventBlock of events) {
+      let eventName = 'message';
+      const dataLines: string[] = [];
+      for (const line of eventBlock.split('\n')) {
+        if (line.startsWith('event:')) {
+          eventName = line.slice('event:'.length).trim();
+        } else if (line.startsWith('data:')) {
+          dataLines.push(line.slice('data:'.length).trim());
+        }
+      }
+      const dataText = dataLines.join('\n');
+      let parsed: Record<string, unknown> | null = null;
+      if (dataText) {
+        try {
+          parsed = JSON.parse(dataText) as Record<string, unknown>;
+        } catch {
+          parsed = null;
+        }
+      }
+      if (eventName === 'progress' && parsed && onProgress) {
+        onProgress(parsed as { phase: string; percent: number; received?: number; total?: number });
+      } else if (eventName === 'done') {
+        finalResult = parsed as { ok: boolean; project?: ProjectMeta; error?: string } || { ok: true };
+        break;
+      } else if (eventName === 'error') {
+        finalResult = { ok: false, error: String(parsed?.error || 'Unknown error') };
+        break;
+      }
+    }
+  }
+
+  reader.releaseLock();
+  return finalResult || { ok: false, error: 'SSE connection failed' };
 }
 
 export async function visionToLatex(payload: {

@@ -2,9 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import {
+  clearCollabToken,
+  clearOwnerToken,
   createProject,
   copyProject,
   deleteProject,
+  getOwnerToken,
+  hasCollabToken,
   importArxivSSE,
   importZip,
   listProjects,
@@ -14,6 +18,7 @@ import {
   trashProject,
   updateProjectTags,
   permanentDeleteProject,
+  setOwnerToken,
   uploadTemplate
 } from '../api/client';
 import type { ProjectMeta, TemplateMeta, TemplateCategory } from '../api/client';
@@ -25,12 +30,14 @@ type SortBy = 'updatedAt' | 'name' | 'createdAt';
 const SETTINGS_KEY = 'openprism-settings-v1';
 
 interface LLMSettings {
+  ownerToken: string;
   llmEndpoint: string;
   llmApiKey: string;
   llmModel: string;
 }
 
 const DEFAULT_LLM: LLMSettings = {
+  ownerToken: '',
   llmEndpoint: 'https://api.openai.com/v1/chat/completions',
   llmApiKey: '',
   llmModel: 'gpt-4o-mini',
@@ -42,6 +49,7 @@ function loadLLMSettings(): LLMSettings {
     if (!raw) return DEFAULT_LLM;
     const parsed = JSON.parse(raw);
     return {
+      ownerToken: getOwnerToken() || DEFAULT_LLM.ownerToken,
       llmEndpoint: parsed.llmEndpoint ?? DEFAULT_LLM.llmEndpoint,
       llmApiKey: parsed.llmApiKey ?? DEFAULT_LLM.llmApiKey,
       llmModel: parsed.llmModel ?? DEFAULT_LLM.llmModel,
@@ -55,7 +63,14 @@ function saveLLMSettings(s: LLMSettings) {
   try {
     const raw = window.localStorage.getItem(SETTINGS_KEY);
     const prev = raw ? JSON.parse(raw) : {};
-    window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...prev, ...s }));
+    const { ownerToken, ...persisted } = s;
+    const { ownerToken: _legacyOwnerToken, ...restPrev } = prev;
+    window.localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...restPrev, ...persisted }));
+    if (ownerToken) {
+      setOwnerToken(ownerToken);
+    } else {
+      clearOwnerToken();
+    }
   } catch {}
 }
 
@@ -144,6 +159,9 @@ export default function ProjectPage() {
   }, []);
 
   useEffect(() => {
+    if (hasCollabToken()) {
+      clearCollabToken();
+    }
     loadProjects().catch((err) => setStatus(t('加载项目失败: {{error}}', { error: String(err) })));
   }, [loadProjects, t]);
 
@@ -1022,6 +1040,16 @@ export default function ProjectPage() {
               <button className="icon-btn" onClick={() => setSettingsOpen(false)}>✕</button>
             </div>
             <div className="modal-body">
+              <div className="field">
+                <label>{t('Owner Token')}</label>
+                <input
+                  className="input"
+                  type="password"
+                  placeholder={t('用于远程项目管理')}
+                  value={settingsForm.ownerToken}
+                  onChange={(e) => setSettingsForm((p) => ({ ...p, ownerToken: e.target.value }))}
+                />
+              </div>
               <div className="field">
                 <label>{t('LLM Endpoint')}</label>
                 <input

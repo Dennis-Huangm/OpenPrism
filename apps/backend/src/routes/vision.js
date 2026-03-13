@@ -4,9 +4,10 @@ import { safeJoin, sanitizeUploadPath } from '../utils/pathUtils.js';
 import { ensureDir } from '../utils/fsUtils.js';
 import { resolveLLMConfig, callOpenAICompatible } from '../services/llmService.js';
 import { getProjectRoot } from '../services/projectService.js';
+import { authorizeProjectAccess } from '../utils/authUtils.js';
 
 export function registerVisionRoutes(fastify) {
-  fastify.post('/api/vision/latex', async (req) => {
+  fastify.post('/api/vision/latex', async (req, reply) => {
     const parts = req.parts();
     let projectId = '';
     let mode = 'equation';
@@ -42,6 +43,16 @@ export function registerVisionRoutes(fastify) {
     }
 
     if (!imageBuffer) return { ok: false, error: 'Missing image.' };
+    const scopedAuth = req.collabAuth || null;
+    if (scopedAuth && !projectId) {
+      return reply.code(403).send({ ok: false, error: 'Forbidden' });
+    }
+    if (projectId) {
+      const authz = authorizeProjectAccess(req, projectId);
+      if (!authz.ok) {
+        return reply.code(authz.statusCode).send({ ok: false, error: authz.error });
+      }
+    }
 
     let assetPath = '';
     if (projectId) {

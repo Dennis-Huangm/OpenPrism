@@ -26,13 +26,14 @@ import {
   getFile,
   getProjectTree,
   getCollabToken,
-  listProjects,
+  setCollabToken,
   renamePath,
   deleteFile,
   updateFileOrder,
   setProjectMainFile,
   runAgent,
   plotFromTable,
+  fetchProjectBlob,
   callLLM,
   uploadFiles,
   visionToLatex,
@@ -144,6 +145,7 @@ const DEFAULT_SETTINGS: AppSettings = {
 
 const COLLAB_NAME_KEY = 'openprism-collab-name';
 const COLLAB_COLORS = ['#b44a2f', '#2f6fb4', '#2f9b74', '#b48a2f', '#6b2fb4', '#b42f6d', '#2f8fb4'];
+const COLLAB_EDITOR_SYNC_MS = 120;
 
 function loadSettings(): AppSettings {
   if (typeof window === 'undefined') return DEFAULT_SETTINGS;
@@ -479,6 +481,20 @@ function getParentPath(target: string) {
   if (!target) return '';
   const idx = target.lastIndexOf('/');
   return idx === -1 ? '' : target.slice(0, idx);
+}
+
+function remapNestedPath(target: string, fromPath: string, nextPath: string) {
+  if (!target) return '';
+  const normalizedTarget = target.replace(/\\/g, '/');
+  const normalizedFrom = fromPath.replace(/\\/g, '/');
+  const normalizedNext = nextPath.replace(/\\/g, '/');
+  if (normalizedTarget === normalizedFrom) {
+    return normalizedNext;
+  }
+  if (normalizedTarget.startsWith(`${normalizedFrom}/`)) {
+    return `${normalizedNext}${normalizedTarget.slice(normalizedFrom.length)}`;
+  }
+  return '';
 }
 
 type TreeNode = {
@@ -1556,6 +1572,7 @@ export default function EditorPage() {
   const [draggingPath, setDraggingPath] = useState('');
   const [dragHint, setDragHint] = useState<{ text: string; x: number; y: number } | null>(null);
   const [mainFile, setMainFile] = useState('');
+  const [pendingCollabSeed, setPendingCollabSeed] = useState<string | null>(null);
   const [fileFilter, setFileFilter] = useState('');
   const [inlineEdit, setInlineEdit] = useState<InlineEdit | null>(null);
   const [fileContextMenu, setFileContextMenu] = useState<{ x: number; y: number } | null>(null);
@@ -1590,6 +1607,7 @@ export default function EditorPage() {
   const [plotBusy, setPlotBusy] = useState(false);
   const [plotStatus, setPlotStatus] = useState('');
   const [plotAssetPath, setPlotAssetPath] = useState('');
+  const [plotAssetUrl, setPlotAssetUrl] = useState('');
   const [plotAutoInsert, setPlotAutoInsert] = useState(true);
   const [websearchQuery, setWebsearchQuery] = useState('');
   const [websearchLog, setWebsearchLog] = useState<string[]>([]);
@@ -1602,6 +1620,7 @@ export default function EditorPage() {
   const [websearchTargetBib, setWebsearchTargetBib] = useState('');
   const [reviewNotes, setReviewNotes] = useState<{ title: string; content: string }[]>([]);
   const [reviewReport, setReviewReport] = useState('');
+  const [figurePreviewUrl, setFigurePreviewUrl] = useState('');
   const [reviewReportBusy, setReviewReportBusy] = useState(false);
   const [diagnoseBusy, setDiagnoseBusy] = useState(false);
   const [websearchSelectedAll, setWebsearchSelectedAll] = useState(false);
@@ -1611,16 +1630,19 @@ export default function EditorPage() {
   const [collabInviteLink, setCollabInviteLink] = useState('');
   const [collabServer, setCollabServerState] = useState(() => getCollabServer() || (typeof window === 'undefined' ? '' : window.location.origin));
   const [collabName, setCollabName] = useState(() => loadCollabName() || 'Guest');
-  const [collabToken] = useState(() => getCollabToken());
+  const [collabToken, setCollabTokenState] = useState(() => getCollabToken());
   const [collabPeers, setCollabPeers] = useState<{ id: number; name: string; color: string }[]>([]);
   const editorHostRef = useRef<HTMLDivElement | null>(null);
   const editorAreaRef = useRef<HTMLDivElement | null>(null);
   const cmViewRef = useRef<EditorView | null>(null);
   const activePathRef = useRef<string>('');
+  const selectedPathRef = useRef<string>('');
+  const openFileTokenRef = useRef(0);
   const inlineSuggestionRef = useRef<string>('');
   const inlineAnchorRef = useRef<number | null>(null);
   const applyingSuggestionRef = useRef(false);
   const suppressDirtyRef = useRef(false);
+  const suppressEditorStateSyncRef = useRef(false);
   const typewriterTimerRef = useRef<number | null>(null);
   const activeConvIdRef = useRef<string | null>(null);
   const sendPromptRef = useRef<((options?: SendPromptOptions) => void) | null>(null);
@@ -1683,7 +1705,7 @@ export default function EditorPage() {
     view.dispatch({ changes, selection });
     return true;
   }, []);
-  const saveActiveFileRef = useRef<() => void>(() => {});
+  const saveActiveFileRef = useRef<(opts?: { silent?: boolean }) => void>(() => {});
   const gridRef = useRef<HTMLDivElement | null>(null);
   const editorSplitRef = useRef<HTMLDivElement | null>(null);
   const pdfContainerRef = useRef<HTMLDivElement | null>(null);
@@ -1701,6 +1723,9 @@ export default function EditorPage() {
   const collabProviderRef = useRef<CollabProvider | null>(null);
   const collabDocRef = useRef<{ doc: Y.Doc; text: Y.Text; awareness: Awareness } | null>(null);
   const collabActiveRef = useRef(false);
+  const latestEditorValueRef = useRef('');
+  const latestFilesRef = useRef<Record<string, string>>({});
+  const collabSyncTimerRef = useRef<number | null>(null);
   const collabColorRef = useRef<string>(pickCollabColor(collabName));
   const collabCompartment = useMemo(() => new Compartment(), []);
 
@@ -1986,33 +2011,111 @@ export default function EditorPage() {
       navigate('/projects', { replace: true });
       return;
     }
-    setProjectName('');
-    listProjects()
-      .then((res) => {
-        const current = res.projects.find((item) => item.id === projectId);
-        if (!current) {
-          setStatus(t('项目不存在或已被删除。'));
-          return;
-        }
-        setProjectName(current.name);
-      })
-      .catch((err) => setStatus(t('加载项目信息失败: {{error}}', { error: String(err) })));
-  }, [navigate, projectId, t]);
+    setProjectName(projectId);
+  }, [navigate, projectId]);
 
   useEffect(() => {
     activePathRef.current = activePath;
   }, [activePath]);
 
   useEffect(() => {
+    selectedPathRef.current = selectedPath;
+  }, [selectedPath]);
+
+  useEffect(() => {
+    latestEditorValueRef.current = editorValue;
+  }, [editorValue]);
+
+  useEffect(() => {
+    latestFilesRef.current = files;
+  }, [files]);
+
+  const syncEditorSnapshotToState = useCallback((path: string, value: string) => {
+    latestEditorValueRef.current = value;
+    setEditorValue(value);
+    setFiles((prev) => {
+      const current = prev[path];
+      if (current === value) {
+        latestFilesRef.current = prev;
+        return prev;
+      }
+      const next = { ...prev, [path]: value };
+      latestFilesRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const scheduleCollabEditorSync = useCallback((path: string, value: string) => {
+    if (collabSyncTimerRef.current) {
+      window.clearTimeout(collabSyncTimerRef.current);
+    }
+    collabSyncTimerRef.current = window.setTimeout(() => {
+      collabSyncTimerRef.current = null;
+      if (!collabActiveRef.current || activePathRef.current !== path) return;
+      syncEditorSnapshotToState(path, value);
+    }, COLLAB_EDITOR_SYNC_MS);
+  }, [syncEditorSnapshotToState]);
+
+  const clearPendingCollabEditorSync = useCallback(() => {
+    if (collabSyncTimerRef.current) {
+      window.clearTimeout(collabSyncTimerRef.current);
+      collabSyncTimerRef.current = null;
+    }
+  }, []);
+
+  const clearEditorState = useCallback(() => {
+    clearPendingCollabEditorSync();
+    latestEditorValueRef.current = '';
+    activePathRef.current = '';
+    setEditorValue('');
+    setActivePath('');
+    setSelectedPath('');
+    selectedPathRef.current = '';
+    setIsDirty(false);
+    const view = cmViewRef.current;
+    if (view) {
+      const currentDoc = view.state.doc.toString();
+      if (currentDoc.length > 0) {
+        suppressDirtyRef.current = true;
+        suppressEditorStateSyncRef.current = true;
+        view.dispatch({
+          changes: { from: 0, to: currentDoc.length, insert: '' },
+          annotations: [Transaction.addToHistory.of(false)]
+        });
+      }
+    }
+  }, [clearPendingCollabEditorSync]);
+
+  const flushCollabEditorSync = useCallback((pathOverride?: string) => {
+    const path = pathOverride ?? activePathRef.current;
+    if (!path) {
+      clearPendingCollabEditorSync();
+      return;
+    }
+    clearPendingCollabEditorSync();
+    const view = cmViewRef.current;
+    const value = view ? view.state.doc.toString() : latestEditorValueRef.current;
+    syncEditorSnapshotToState(path, value);
+  }, [clearPendingCollabEditorSync, syncEditorSnapshotToState]);
+
+  const getCurrentEditorValue = useCallback(() => {
+    const view = cmViewRef.current;
+    return view ? view.state.doc.toString() : latestEditorValueRef.current;
+  }, []);
+
+  useEffect(() => {
     const view = cmViewRef.current;
     if (!view) return;
     if (!collabEnabled || !projectId || !activePath) {
+      const previousPath = activePathRef.current;
       collabActiveRef.current = false;
+      flushCollabEditorSync(previousPath || undefined);
       if (collabProviderRef.current) {
         collabProviderRef.current.disconnect();
         collabProviderRef.current = null;
       }
       collabDocRef.current = null;
+      setPendingCollabSeed(null);
       view.dispatch({ effects: collabCompartment.reconfigure([]) });
       setCollabStatus('disconnected');
       setCollabPeers([]);
@@ -2020,27 +2123,37 @@ export default function EditorPage() {
     }
     if (!isTextPath(activePath)) {
       collabActiveRef.current = false;
+      clearPendingCollabEditorSync();
       if (collabProviderRef.current) {
         collabProviderRef.current.disconnect();
         collabProviderRef.current = null;
       }
       collabDocRef.current = null;
+      setPendingCollabSeed(null);
       view.dispatch({ effects: collabCompartment.reconfigure([]) });
       setCollabStatus('disconnected');
       setCollabPeers([]);
       setStatus(t('协作暂不支持该文件类型。'));
       return;
     }
+
     const currentDoc = view.state.doc.toString();
-    if (currentDoc.length > 0) {
-      suppressDirtyRef.current = true;
-      view.dispatch({ changes: { from: 0, to: currentDoc.length, insert: '' } });
+    const fileSnapshot = Object.prototype.hasOwnProperty.call(latestFilesRef.current, activePath)
+      ? latestFilesRef.current[activePath] ?? ''
+      : null;
+    const localSnapshot = pendingCollabSeed ?? fileSnapshot ?? '';
+    if (localSnapshot) {
+      syncEditorSnapshotToState(activePath, localSnapshot);
     }
-    setEditorValue('');
-    setIsDirty(false);
+    if (isDirty && currentDoc === localSnapshot) {
+      saveActiveFileRef.current({ silent: true });
+    }
 
     const ydoc = new Y.Doc();
     const ytext = ydoc.getText('content');
+    if (localSnapshot) {
+      ytext.insert(0, localSnapshot);
+    }
     const awareness = new Awareness(ydoc);
     awareness.setLocalStateField('user', {
       name: collabName,
@@ -2080,15 +2193,17 @@ export default function EditorPage() {
 
     return () => {
       collabActiveRef.current = false;
+      clearPendingCollabEditorSync();
       awareness.off('update', updatePeers);
       provider.disconnect();
       collabProviderRef.current = null;
       collabDocRef.current = null;
+      setPendingCollabSeed(null);
       ydoc.destroy();
       view.dispatch({ effects: collabCompartment.reconfigure([]) });
       setCollabPeers([]);
     };
-  }, [activePath, collabCompartment, collabEnabled, collabName, collabServer, collabToken, projectId, t]);
+  }, [activePath, clearPendingCollabEditorSync, collabCompartment, collabEnabled, collabName, collabServer, collabToken, flushCollabEditorSync, isDirty, projectId, syncEditorSnapshotToState, t]);
 
   const handleCreateInvite = useCallback(async () => {
     if (!projectId) return;
@@ -2100,7 +2215,9 @@ export default function EditorPage() {
       }
       const baseInput = normalizeServerUrl(collabServer) || (typeof window === 'undefined' ? '' : window.location.origin);
       const base = baseInput.replace(/\/$/, '');
-      const link = `${base}/collab?token=${encodeURIComponent(res.token)}`;
+      const link = `${base}/collab#join=${encodeURIComponent(res.joinToken)}`;
+      setCollabToken(res.token, projectId);
+      setCollabTokenState(res.token);
       setCollabInviteLink(link);
       if (!collabEnabled) {
         setCollabEnabled(true);
@@ -2126,26 +2243,41 @@ export default function EditorPage() {
   const refreshTree = async (keepActive = true) => {
     if (!projectId) return;
     const res = await getProjectTree(projectId);
-    setTree(res.items);
+    const nextItems = res.items;
+    setTree(nextItems);
     setFileOrder(res.fileOrder || {});
     setMainFile(res.mainFile || '');
-    if (!keepActive || !activePath || !res.items.find((item) => item.path === activePath)) {
-      const main = res.mainFile && res.items.find((item) => item.path === res.mainFile)?.path;
-      const legacyMain = res.items.find((item) => item.path.endsWith('main.tex'))?.path;
-      const next = main || legacyMain || res.items.find((item) => item.type === 'file')?.path || '';
+    const currentActivePath = activePathRef.current;
+    const currentSelectedPath = selectedPathRef.current;
+    const nextActivePath = keepActive && currentActivePath && nextItems.find((item) => item.path === currentActivePath)
+      ? currentActivePath
+      : '';
+    if (!nextActivePath) {
+      const main = res.mainFile && nextItems.find((item) => item.path === res.mainFile)?.path;
+      const legacyMain = nextItems.find((item) => item.path.endsWith('main.tex'))?.path;
+      const next = main || legacyMain || nextItems.find((item) => item.type === 'file')?.path || '';
       if (next) {
         await openFile(next);
+        return;
       }
+      clearEditorState();
+      return;
     }
+    const nextSelectedPath = currentSelectedPath && nextItems.find((item) => item.path === currentSelectedPath)
+      ? currentSelectedPath
+      : nextActivePath;
+    selectedPathRef.current = nextSelectedPath;
+    setSelectedPath(nextSelectedPath);
   };
 
   useEffect(() => {
     if (!projectId) return;
+    latestFilesRef.current = {};
     setFiles({});
-    setActivePath('');
+    clearEditorState();
     refreshTree(false).catch((err) => setStatus(t('加载文件树失败: {{error}}', { error: String(err) })));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [projectId, t]);
+  }, [clearEditorState, projectId, t]);
 
 
   useEffect(() => {
@@ -2155,16 +2287,24 @@ export default function EditorPage() {
       const skipClear = applyingSuggestionRef.current;
       if (update.docChanged) {
         const value = update.state.doc.toString();
+        latestEditorValueRef.current = value;
         const programmatic = suppressDirtyRef.current;
-        setEditorValue(value);
-        if (!programmatic && !collabActiveRef.current) {
+        const skipStateSync = suppressEditorStateSyncRef.current;
+        const collabActive = collabActiveRef.current;
+        const path = activePathRef.current;
+        if (!programmatic && !collabActive) {
           setIsDirty(true);
         } else {
           suppressDirtyRef.current = false;
         }
-        const path = activePathRef.current;
-        if (path && (!programmatic || collabActiveRef.current)) {
-          setFiles((prev) => ({ ...prev, [path]: value }));
+        if (skipStateSync) {
+          suppressEditorStateSyncRef.current = false;
+        } else if (!path) {
+          setEditorValue(value);
+        } else if (collabActive) {
+          scheduleCollabEditorSync(path, value);
+        } else {
+          syncEditorSnapshotToState(path, value);
         }
       }
       if (update.selectionSet) {
@@ -2301,11 +2441,22 @@ export default function EditorPage() {
       view.destroy();
       cmViewRef.current = null;
     };
-  }, []);
+  }, [scheduleCollabEditorSync, syncEditorSnapshotToState]);
+
+  useEffect(() => {
+    return () => {
+      clearPendingCollabEditorSync();
+    };
+  }, [clearPendingCollabEditorSync]);
 
   const openFile = async (filePath: string) => {
+    const requestToken = openFileTokenRef.current + 1;
+    openFileTokenRef.current = requestToken;
+    flushCollabEditorSync();
+    setPendingCollabSeed(null);
     setActivePath(filePath);
     activePathRef.current = filePath;
+    selectedPathRef.current = filePath;
     setSelectedPath(filePath);
     if (filePath.includes('/')) {
       const parts = filePath.split('/').slice(0, -1);
@@ -2319,24 +2470,45 @@ export default function EditorPage() {
         return next;
       });
     }
-    if (Object.prototype.hasOwnProperty.call(files, filePath)) {
-      const cached = files[filePath] ?? '';
+    const cachedFiles = latestFilesRef.current;
+    if (Object.prototype.hasOwnProperty.call(cachedFiles, filePath)) {
+      if (openFileTokenRef.current !== requestToken || activePathRef.current !== filePath) {
+        return cachedFiles[filePath] ?? '';
+      }
+      const cached = cachedFiles[filePath] ?? '';
       const collabTextFile = collabEnabled && isTextPath(filePath);
-      setEditorValue(collabTextFile ? '' : cached);
-      setIsDirty(false);
-      if (!collabTextFile) {
+      if (collabTextFile) {
+        setPendingCollabSeed(cached);
+        latestEditorValueRef.current = '';
+        setEditorValue('');
+      } else {
+        latestEditorValueRef.current = cached;
+        setEditorValue(cached);
         setEditorDoc(cached);
       }
+      setIsDirty(false);
       return cached;
     }
     const data = await getFile(projectId, filePath);
-    setFiles((prev) => ({ ...prev, [filePath]: data.content }));
+    if (openFileTokenRef.current !== requestToken || activePathRef.current !== filePath) {
+      return data.content;
+    }
+    setFiles((prev) => {
+      const next = { ...prev, [filePath]: data.content };
+      latestFilesRef.current = next;
+      return next;
+    });
     const collabTextFile = collabEnabled && isTextPath(filePath);
-    setEditorValue(collabTextFile ? '' : data.content);
-    setIsDirty(false);
-    if (!collabTextFile) {
+    if (collabTextFile) {
+      setPendingCollabSeed(data.content);
+      latestEditorValueRef.current = '';
+      setEditorValue('');
+    } else {
+      latestEditorValueRef.current = data.content;
+      setEditorValue(data.content);
       setEditorDoc(data.content);
     }
+    setIsDirty(false);
     return data.content;
   };
 
@@ -2523,7 +2695,9 @@ export default function EditorPage() {
   const saveActiveFile = useCallback(
     async (opts?: { silent?: boolean }) => {
       if (!activePath) return;
+      const content = getCurrentEditorValue();
       if (collabActiveRef.current) {
+        flushCollabEditorSync();
         setIsSaving(true);
         try {
           await flushCollabFile(projectId, activePath);
@@ -2541,7 +2715,9 @@ export default function EditorPage() {
       }
       setIsSaving(true);
       try {
-        await writeFile(projectId, activePath, editorValue);
+        await writeFile(projectId, activePath, content);
+        latestEditorValueRef.current = content;
+        setEditorValue(content);
         setIsDirty(false);
         setSavePulse(true);
         window.setTimeout(() => setSavePulse(false), 1200);
@@ -2554,7 +2730,7 @@ export default function EditorPage() {
         setIsSaving(false);
       }
     },
-    [activePath, editorValue, projectId, t]
+    [activePath, flushCollabEditorSync, getCurrentEditorValue, projectId, t]
   );
 
   const writeFileCompat = useCallback(
@@ -2574,14 +2750,17 @@ export default function EditorPage() {
   );
 
   useEffect(() => {
-    saveActiveFileRef.current = () => saveActiveFile();
+    saveActiveFileRef.current = (opts) => {
+      void saveActiveFile(opts);
+    };
   }, [saveActiveFile]);
 
   useEffect(() => {
     if (!cmViewRef.current) return;
-    if (collabActiveRef.current || collabEnabled) return;
+    if (collabActiveRef.current) return;
+    if (collabEnabled && collabStatus === 'connecting') return;
     setEditorDoc(editorValue);
-  }, [editorValue, setEditorDoc, collabEnabled]);
+  }, [collabEnabled, collabStatus, editorValue, setEditorDoc]);
 
   useEffect(() => {
     if (collabActiveRef.current) return;
@@ -2679,14 +2858,22 @@ export default function EditorPage() {
 
   const ensureFileContent = useCallback(
     async (path: string) => {
-      if (Object.prototype.hasOwnProperty.call(files, path)) {
-        return files[path] ?? '';
+      if (path === activePathRef.current) {
+        return getCurrentEditorValue();
+      }
+      const cachedFiles = latestFilesRef.current;
+      if (Object.prototype.hasOwnProperty.call(cachedFiles, path)) {
+        return cachedFiles[path] ?? '';
       }
       const data = await getFile(projectId, path);
-      setFiles((prev) => ({ ...prev, [path]: data.content }));
+      setFiles((prev) => {
+        const next = { ...prev, [path]: data.content };
+        latestFilesRef.current = next;
+        return next;
+      });
       return data.content;
     },
-    [files, projectId]
+    [getCurrentEditorValue, projectId]
   );
 
   const buildProjectContext = useCallback(async () => {
@@ -2859,8 +3046,13 @@ export default function EditorPage() {
         content += `${normalizedBibtex.trim()}\n`;
       }
       await writeFileCompat(targetBib, content);
-      setFiles((prev) => ({ ...prev, [targetBib]: content }));
+      setFiles((prev) => {
+        const next = { ...prev, [targetBib]: content };
+        latestFilesRef.current = next;
+        return next;
+      });
       if (activePath === targetBib) {
+        latestEditorValueRef.current = content;
         setEditorValue(content);
         if (!collabActiveRef.current) {
           setEditorDoc(content);
@@ -2915,7 +3107,7 @@ export default function EditorPage() {
           if (res.patches && res.patches.length > 0) {
             const nextPending = res.patches.map((patch) => ({
               filePath: patch.path,
-              original: files[patch.path] ?? '',
+              original: patch.path === activePath ? getCurrentEditorValue() : (latestFilesRef.current[patch.path] ?? ''),
               proposed: patch.content,
               diff: patch.diff
             }));
@@ -2940,7 +3132,10 @@ export default function EditorPage() {
 
   const handlePlotGenerate = async () => {
     if (!projectId) return;
-    if (!selectionText || (!selectionText.includes('\\begin{tabular') && !selectionText.includes('\\begin{table'))) {
+    const currentSelectionText = selectionRange[0] === selectionRange[1]
+      ? ''
+      : getCurrentEditorValue().slice(selectionRange[0], selectionRange[1]);
+    if (!currentSelectionText || (!currentSelectionText.includes('\\begin{tabular') && !currentSelectionText.includes('\\begin{table'))) {
       setPlotStatus(t('请在编辑器中选择一个 LaTeX 表格 (tabular)。'));
       return;
     }
@@ -2949,7 +3144,7 @@ export default function EditorPage() {
     try {
       const res = await plotFromTable({
         projectId,
-        tableLatex: selectionText,
+        tableLatex: currentSelectionText,
         chartType: plotType,
         title: plotTitle.trim() || undefined,
         prompt: plotPrompt.trim() || undefined,
@@ -3178,7 +3373,11 @@ export default function EditorPage() {
       content += `${normalized.trim()}\n`;
     });
     await writeFileCompat(targetBib, content);
-    setFiles((prev) => ({ ...prev, [targetBib]: content }));
+    setFiles((prev) => {
+      const next = { ...prev, [targetBib]: content };
+      latestFilesRef.current = next;
+      return next;
+    });
     appendLog(setWebsearchLog, t('Bib 写入完成: {{path}}', { path: targetBib }));
 
     const targetFile = websearchTargetFile || mainFile || activePath;
@@ -3196,8 +3395,13 @@ export default function EditorPage() {
       const insertText = insertBlock ? `\n${insertBlock}\n` : '\n';
       const nextContent = `${targetContent}\n${insertText}`.replace(/\n{3,}/g, '\n\n');
       await writeFileCompat(targetFile, nextContent);
-      setFiles((prev) => ({ ...prev, [targetFile]: nextContent }));
+      setFiles((prev) => {
+        const next = { ...prev, [targetFile]: nextContent };
+        latestFilesRef.current = next;
+        return next;
+      });
       if (activePath === targetFile) {
+        latestEditorValueRef.current = nextContent;
         setEditorValue(nextContent);
         if (!collabActiveRef.current) {
           setEditorDoc(nextContent);
@@ -3281,23 +3485,22 @@ export default function EditorPage() {
 
   const handleDeleteFile = async () => {
     if (!projectId) return;
-    const target = selectedPath || activePath;
+    const target = selectedPathRef.current || activePathRef.current;
     if (!target) return;
 
     const confirmMessage = t('确定要删除 "{name}" 吗？此操作不可恢复。', { name: target.split('/').pop() || target });
     if (!window.confirm(confirmMessage)) return;
 
     try {
+      if (collabActiveRef.current && target === activePath) {
+        flushCollabEditorSync();
+        await flushCollabFile(projectId, target);
+      }
       const result = await deleteFile(projectId, target);
       if (result.ok) {
-        // If deleted file was the active file, clear it
-        if (target === activePath) {
-          setActivePath('');
-          setContent('');
-        }
+        clearPathsAfterDelete(target);
         await clearMainFileIfDeleted(target);
-        // Refresh the file tree
-        refreshTree();
+        await refreshTree();
       } else {
         alert(result.error || t('删除失败'));
       }
@@ -3320,12 +3523,14 @@ export default function EditorPage() {
       const to = parent ? `${parent}/${value}` : value;
       const entry = tree.find((item) => item.path === from);
       const fromName = from.split('/').pop() || '';
-      await renamePath(projectId, from, to);
-      await syncMainFileAfterPathChange(from, to);
-      if (activePath === from) {
-        setActivePath(to);
-        activePathRef.current = to;
+      if (collabActiveRef.current && from === activePath) {
+        flushCollabEditorSync();
+        await flushCollabFile(projectId, from);
       }
+      await renamePath(projectId, from, to);
+      syncPathsAfterPathChange(from, to);
+      await syncMainFileAfterPathChange(from, to);
+      selectedPathRef.current = to;
       setSelectedPath(to);
       if (parent && fromName && fileOrder[parent]) {
         const nextOrder = fileOrder[parent].map((name) => (name === fromName ? value : name));
@@ -3368,12 +3573,14 @@ export default function EditorPage() {
     if (!fileName) return;
     const target = folderPath ? `${folderPath}/${fileName}` : fileName;
     if (target === fromPath) return;
-    await renamePath(projectId, fromPath, target);
-    await syncMainFileAfterPathChange(fromPath, target);
-    if (activePath === fromPath) {
-      setActivePath(target);
-      activePathRef.current = target;
+    if (collabActiveRef.current && fromPath === activePath) {
+      flushCollabEditorSync();
+      await flushCollabFile(projectId, fromPath);
     }
+    await renamePath(projectId, fromPath, target);
+    syncPathsAfterPathChange(fromPath, target);
+    await syncMainFileAfterPathChange(fromPath, target);
+    selectedPathRef.current = target;
     setSelectedPath(target);
 
     const fromParent = getParentPath(fromPath);
@@ -3419,14 +3626,7 @@ export default function EditorPage() {
 
   const syncMainFileAfterPathChange = useCallback(async (fromPath: string, nextPath: string) => {
     if (!projectId || !mainFile) return;
-    const normalizedMainFile = mainFile.replace(/\\/g, '/');
-    const normalizedFromPath = fromPath.replace(/\\/g, '/');
-    const normalizedNextPath = nextPath.replace(/\\/g, '/');
-    const nextMainFile = normalizedMainFile === normalizedFromPath
-      ? normalizedNextPath
-      : normalizedMainFile.startsWith(`${normalizedFromPath}/`)
-        ? `${normalizedNextPath}${normalizedMainFile.slice(normalizedFromPath.length)}`
-        : '';
+    const nextMainFile = remapNestedPath(mainFile, fromPath, nextPath);
     if (!nextMainFile) return;
     setMainFile(nextMainFile);
     try {
@@ -3448,6 +3648,77 @@ export default function EditorPage() {
       // ignore persistence failure and keep local selection cleared
     }
   }, [mainFile, projectId]);
+
+  const syncPathsAfterPathChange = useCallback((fromPath: string, nextPath: string) => {
+    const nextActivePath = remapNestedPath(activePathRef.current, fromPath, nextPath);
+    if (nextActivePath) {
+      activePathRef.current = nextActivePath;
+      setActivePath(nextActivePath);
+    }
+    setSelectedPath((prev) => {
+      const remapped = remapNestedPath(prev, fromPath, nextPath);
+      const nextSelectedPath = remapped || prev;
+      selectedPathRef.current = nextSelectedPath;
+      return nextSelectedPath;
+    });
+    setFiles((prev) => {
+      let changed = false;
+      const nextEntries = Object.entries(prev).map(([path, content]) => {
+        const remapped = remapNestedPath(path, fromPath, nextPath);
+        if (!remapped) {
+          return [path, content];
+        }
+        changed = true;
+        return [remapped, content];
+      });
+      if (!changed) {
+        latestFilesRef.current = prev;
+        return prev;
+      }
+      const next = Object.fromEntries(nextEntries);
+      latestFilesRef.current = next;
+      return next;
+    });
+    setOpenFolders((prev) => {
+      let changed = false;
+      const nextEntries = Object.entries(prev).map(([path, open]) => {
+        const remapped = remapNestedPath(path, fromPath, nextPath);
+        if (!remapped) {
+          return [path, open];
+        }
+        changed = true;
+        return [remapped, open];
+      });
+      return changed ? Object.fromEntries(nextEntries) : prev;
+    });
+  }, []);
+
+  const clearPathsAfterDelete = useCallback((targetPath: string) => {
+    const normalizedTargetPath = targetPath.replace(/\\/g, '/');
+    const targetPrefix = `${normalizedTargetPath}/`;
+    if (activePathRef.current === normalizedTargetPath || activePathRef.current.startsWith(targetPrefix)) {
+      clearEditorState();
+    }
+    setSelectedPath((prev) => {
+      const nextSelectedPath = prev === normalizedTargetPath || prev.startsWith(targetPrefix) ? '' : prev;
+      selectedPathRef.current = nextSelectedPath;
+      return nextSelectedPath;
+    });
+    setFiles((prev) => {
+      const nextEntries = Object.entries(prev).filter(([path]) => path !== normalizedTargetPath && !path.startsWith(targetPrefix));
+      if (nextEntries.length === Object.keys(prev).length) {
+        latestFilesRef.current = prev;
+        return prev;
+      }
+      const next = Object.fromEntries(nextEntries);
+      latestFilesRef.current = next;
+      return next;
+    });
+    setOpenFolders((prev) => {
+      const nextEntries = Object.entries(prev).filter(([path]) => path !== normalizedTargetPath && !path.startsWith(targetPrefix));
+      return nextEntries.length === Object.keys(prev).length ? prev : Object.fromEntries(nextEntries);
+    });
+  }, [clearEditorState]);
 
   const filteredTreeItems = useMemo(() => {
     const term = fileFilter.trim().toLowerCase();
@@ -3517,7 +3788,7 @@ export default function EditorPage() {
       return;
     }
     if (activePath === mainFile) {
-      setOutlineText(editorValue);
+      setOutlineText(collabActiveRef.current ? latestEditorValueRef.current : editorValue);
       return;
     }
     let cancelled = false;
@@ -3607,10 +3878,12 @@ export default function EditorPage() {
 
   const toggleFolder = (path: string) => {
     setOpenFolders((prev) => ({ ...prev, [path]: !prev[path] }));
+    selectedPathRef.current = path;
     setSelectedPath(path);
   };
 
   const handleFileSelect = async (path: string) => {
+    selectedPathRef.current = path;
     setSelectedPath(path);
     if (isFigureFile(path)) {
       setSelectedFigure(path);
@@ -3660,7 +3933,7 @@ export default function EditorPage() {
     if (!targetFile) return;
     let content = '';
     try {
-      content = targetFile === activePath ? editorValue : await openFile(targetFile);
+      content = targetFile === activePath ? getCurrentEditorValue() : await openFile(targetFile);
     } catch {
       return;
     }
@@ -3848,21 +4121,9 @@ export default function EditorPage() {
     setIsCompiling(true);
     setStatus(t('编译中...'));
     try {
-      const { files: serverFiles } = await getAllFiles(projectId);
-      const fileMap: Record<string, string | Uint8Array> = {};
-      for (const file of serverFiles) {
-        if (file.encoding === 'base64') {
-          const binary = Uint8Array.from(atob(file.content), (c) => c.charCodeAt(0));
-          fileMap[file.path] = binary;
-        } else {
-          fileMap[file.path] = files[file.path] ?? file.content;
-        }
-      }
-      if (activePath) {
-        fileMap[activePath] = editorValue;
-      }
-      if (!fileMap[mainFile]) {
-        throw new Error(t('主文件不存在: {{file}}', { file: mainFile }));
+      if (collabActiveRef.current && activePath) {
+        flushCollabEditorSync();
+        await flushCollabFile(projectId, activePath);
       }
       const res = await compileProject({ projectId, mainFile, engine: compileEngine });
       if (!res.ok || !res.pdf) {
@@ -3930,6 +4191,84 @@ export default function EditorPage() {
       setSelectedFigure(figureFiles[0].path);
     }
   }, [figureFiles, selectedFigure]);
+
+  useEffect(() => {
+    if (!projectId || !plotAssetPath) {
+      setPlotAssetUrl((prev) => {
+        if (prev) {
+          URL.revokeObjectURL(prev);
+        }
+        return '';
+      });
+      return;
+    }
+    let cancelled = false;
+    fetchProjectBlob(projectId, plotAssetPath)
+      .then((blob) => {
+        if (cancelled) {
+          return;
+        }
+        const nextUrl = URL.createObjectURL(blob);
+        setPlotAssetUrl((prev) => {
+          if (prev) {
+            URL.revokeObjectURL(prev);
+          }
+          return nextUrl;
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setPlotAssetUrl((prev) => {
+            if (prev) {
+              URL.revokeObjectURL(prev);
+            }
+            return '';
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [plotAssetPath, projectId]);
+
+  useEffect(() => {
+    if (!projectId || !selectedFigure) {
+      setFigurePreviewUrl((prev) => {
+        if (prev) {
+          URL.revokeObjectURL(prev);
+        }
+        return '';
+      });
+      return;
+    }
+    let cancelled = false;
+    fetchProjectBlob(projectId, selectedFigure)
+      .then((blob) => {
+        if (cancelled) {
+          return;
+        }
+        const nextUrl = URL.createObjectURL(blob);
+        setFigurePreviewUrl((prev) => {
+          if (prev) {
+            URL.revokeObjectURL(prev);
+          }
+          return nextUrl;
+        });
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setFigurePreviewUrl((prev) => {
+            if (prev) {
+              URL.revokeObjectURL(prev);
+            }
+            return '';
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, selectedFigure]);
 
   useEffect(() => {
     setPdfAnnotations([]);
@@ -4142,8 +4481,12 @@ export default function EditorPage() {
       sendInFlightRef.current = false;
       return;
     }
+    const currentEditorValue = getCurrentEditorValue();
+    const currentSelectionText = selectionRange[0] === selectionRange[1]
+      ? ''
+      : currentEditorValue.slice(selectionRange[0], selectionRange[1]);
     if (isChat === false && task === 'translate') {
-      if (translateScope === 'selection' && !selectionText) {
+      if (translateScope === 'selection' && !currentSelectionText) {
         setStatus(t('请选择要翻译的文本。'));
         sendInFlightRef.current = false;
         return;
@@ -4159,8 +4502,8 @@ export default function EditorPage() {
     setPrompt('');
     try {
       let effectivePrompt = requestPrompt;
-      let effectiveSelection = selectionText;
-      let effectiveContent = editorValue;
+      let effectiveSelection = currentSelectionText;
+      let effectiveContent = currentEditorValue;
       let effectiveCompileLog = compileLog;
       let effectiveMode = mode;
       let effectiveTask = task;
@@ -4250,18 +4593,18 @@ export default function EditorPage() {
       if (!isChat && res.patches && res.patches.length > 0) {
         const nextPending = res.patches.map((patch) => ({
           filePath: patch.path,
-          original: files[patch.path] ?? '',
+          original: patch.path === activePath ? currentEditorValue : (latestFilesRef.current[patch.path] ?? ''),
           proposed: patch.content,
           diff: patch.diff
         }));
         setPendingChanges(nextPending);
         setRightView('diff');
       } else if (!isChat && res.suggestion) {
-        const proposed = selectionText
-          ? replaceSelection(editorValue, selectionRange[0], selectionRange[1], res.suggestion)
+        const proposed = currentSelectionText
+          ? replaceSelection(currentEditorValue, selectionRange[0], selectionRange[1], res.suggestion)
           : res.suggestion;
-        const diff = createTwoFilesPatch(activePath, activePath, editorValue, proposed, 'current', 'suggested');
-        setPendingChanges([{ filePath: activePath, original: editorValue, proposed, diff }]);
+        const diff = createTwoFilesPatch(activePath, activePath, currentEditorValue, proposed, 'current', 'suggested');
+        setPendingChanges([{ filePath: activePath, original: currentEditorValue, proposed, diff }]);
         setRightView('diff');
       }
     } catch (err) {
@@ -4303,7 +4646,7 @@ export default function EditorPage() {
     chatMessages,
     compileLog,
     editorValue,
-    files,
+    getCurrentEditorValue,
     llmConfig,
     mode,
     persistCurrentConversation,
@@ -4336,11 +4679,12 @@ export default function EditorPage() {
     const nextHistory = [...agentMessages, userMsg].slice(-MAX_MESSAGES);
     setAgentMessages(nextHistory);
     try {
+      const currentEditorValue = getCurrentEditorValue();
       const res = await runAgent({
         task: 'debug_compile',
         prompt: t('基于编译日志诊断并修复错误，给出可应用的 diff。'),
         selection: compileLog,
-        content: editorValue,
+        content: currentEditorValue,
         mode: 'tools',
         projectId,
         activePath,
@@ -4371,7 +4715,7 @@ export default function EditorPage() {
       if (res.patches && res.patches.length > 0) {
         const nextPending = res.patches.map((patch) => ({
           filePath: patch.path,
-          original: files[patch.path] ?? '',
+          original: patch.path === activePath ? currentEditorValue : (latestFilesRef.current[patch.path] ?? ''),
           proposed: patch.content,
           diff: patch.diff
         }));
@@ -4404,7 +4748,14 @@ export default function EditorPage() {
     const list = change ? [change] : pendingChanges;
     for (const item of list) {
       await writeFileCompat(item.filePath, item.proposed);
-      setFiles((prev) => ({ ...prev, [item.filePath]: item.proposed }));
+      setFiles((prev) => {
+        const next = { ...prev, [item.filePath]: item.proposed };
+        latestFilesRef.current = next;
+        return next;
+      });
+      if (activePath === item.filePath) {
+        latestEditorValueRef.current = item.proposed;
+      }
       if (activePath === item.filePath && !collabActiveRef.current) {
         setEditorDoc(item.proposed);
       }
@@ -5772,11 +6123,13 @@ export default function EditorPage() {
                     {plotAssetPath && (
                       <div className="vision-result">
                         <div className="muted">{t('预览')}</div>
-                        <img
-                          src={`/api/projects/${projectId}/blob?path=${encodeURIComponent(plotAssetPath)}`}
-                          alt={plotAssetPath}
-                          style={{ width: '100%', borderRadius: '8px' }}
-                        />
+                        {plotAssetUrl ? (
+                          <img
+                            src={plotAssetUrl}
+                            alt={plotAssetPath}
+                            style={{ width: '100%', borderRadius: '8px' }}
+                          />
+                        ) : null}
                         <div className="row">
                           <button className="btn ghost" onClick={() => insertFigureSnippet(plotAssetPath)}>{t('插入图模板')}</button>
                         </div>
@@ -5897,7 +6250,7 @@ Be thorough. Read ALL .tex files before reporting. Group findings by category. I
                           if (res.patches && res.patches.length > 0) {
                             const nextPending = res.patches.map((patch) => ({
                               filePath: patch.path,
-                              original: files[patch.path] ?? '',
+                              original: patch.path === activePath ? getCurrentEditorValue() : (latestFilesRef.current[patch.path] ?? ''),
                               proposed: patch.content,
                               diff: patch.diff
                             }));
@@ -6289,11 +6642,13 @@ Be thorough. Read ALL .tex files before reporting. Group findings by category. I
                   </div>
                   <div className="figure-display">
                     {selectedFigure ? (
-                      selectedFigure.toLowerCase().endsWith('.pdf') ? (
-                        <object data={`/api/projects/${projectId}/blob?path=${encodeURIComponent(selectedFigure)}`} type="application/pdf" />
-                      ) : (
-                        <img src={`/api/projects/${projectId}/blob?path=${encodeURIComponent(selectedFigure)}`} alt={selectedFigure} />
-                      )
+                      figurePreviewUrl ? (
+                        selectedFigure.toLowerCase().endsWith('.pdf') ? (
+                          <object data={figurePreviewUrl} type="application/pdf" />
+                        ) : (
+                          <img src={figurePreviewUrl} alt={selectedFigure} />
+                        )
+                      ) : null
                     ) : (
                       <div className="figure-empty">
                         <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>
